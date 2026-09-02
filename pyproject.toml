@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-unpack"
+version = "0.1.0"
+description = "Android APK packer detection, unpacking, and backend URL extraction"
+requires-python = ">=3.10"
+authors = [{ name = "Miaoliuliu" }]
+dependencies = [
+    "androguard>=4.1.0",
+    "loguru>=0.7.0",
+]
+
+[project.optional-dependencies]
+dump = [
+    "frida>=16.0.0",
+    "frida-tools",
+]
+dev = [
+    "androguard>=4.1.0",
+    "loguru>=0.7.0",
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[project.scripts]
+auto-unpack = "auto_unpack.flow.cli:main"
+auto-unpack-router = "auto_unpack.packer.apkid:main"
+auto-unpack-detect = "auto_unpack.packer.packer_sigs:main"
+auto-unpack-analyze = "auto_unpack.extraction.analyze:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"auto_unpack.unpacker" = ["dpt_shell_dump.js"]

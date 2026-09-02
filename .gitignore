@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime config (copy from env.example.json)
+env.json
+.env
+.env.*
+
+# Runtime products and APKs
+outputs/
+APK/
+*.apk
+*.xapk
+*.apks
+*.aab
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# Agent / session notes
+.workbuddy/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
