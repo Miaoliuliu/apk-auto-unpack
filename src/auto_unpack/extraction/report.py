@@ -187,8 +187,16 @@ def _collect_packer_candidates(task, packed: bool | str) -> list[str]:
     return candidates
 
 
+def _has_runtime_warning(task) -> bool:
+    """空结果但有 encrypted_config / runtime_h5 提示：静态盲区，标记 needs_review。"""
+    return any(
+        (w or "").startswith(("encrypted_config", "runtime_h5"))
+        for w in (task.warnings or [])
+    )
+
+
 def _project_urls(task) -> tuple[list[dict], dict, str]:
-    """URL 投影 + 类型计数 + 提取状态。"""
+    """URL 投影 + 类型计数 + 提取状态（failed / empty / needs_review / ok）。"""
     urls = [project_url(u) for u in (task.urls or [])]
     types = {"url": 0, "domain": 0, "ip": 0}
     for u in urls:
@@ -198,7 +206,7 @@ def _project_urls(task) -> tuple[list[dict], dict, str]:
     if extract_err:
         extraction_status = "failed"
     elif not urls:
-        extraction_status = "empty"
+        extraction_status = "needs_review" if _has_runtime_warning(task) else "empty"
     else:
         extraction_status = "ok"
     return urls, types, extraction_status

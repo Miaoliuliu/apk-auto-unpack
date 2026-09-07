@@ -81,23 +81,26 @@ def _preflight() -> None:
         sys.exit(0)
 
 
+def _build_argv(config: dict) -> list[str]:
+    """把内嵌配置转成内部命令行参数（用户无需手动输入）。"""
+    argv = ["analyze"]
+    if config.get("unpack"):
+        argv.append("--unpack")
+    if config.get("install"):
+        argv += ["--install", config["install"]]
+    if config.get("skip_apkid"):
+        argv.append("--skip-apkid")
+    if config.get("recursive"):
+        argv.append("-r")
+    return argv
+
+
 def main() -> int:
     _preflight()
 
     from auto_unpack.flow.cli import main as cli_main
 
-    # 内嵌参数 → 转成内部命令行参数（用户无需手动输入）
-    argv = ["analyze"]
-    if CONFIG["unpack"]:
-        argv.append("--unpack")
-    if CONFIG["install"]:
-        argv += ["--install", CONFIG["install"]]
-    if CONFIG["skip_apkid"]:
-        argv.append("--skip-apkid")
-    if CONFIG["recursive"]:
-        argv.append("-r")
-
-    return cli_main(argv)
+    return cli_main(_build_argv(CONFIG))
 
 
 if __name__ == "__main__":

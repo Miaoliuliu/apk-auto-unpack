@@ -317,3 +317,118 @@ def test_hex_packer_pairs_wrong_ext():
     assert ps._find_hex_packer_pairs(
         {"lib39285EFA.so"}, {"39285EFA.png"},
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# _is_jdog_native_loader：JDog native loader 符号判定
+# ---------------------------------------------------------------------------
+def test_is_jdog_native_loader_hit():
+    data = b"com/jdog/JLibrary ... __LoadDexLow ..."
+    assert ps._is_jdog_native_loader(data) is True
+
+
+def test_is_jdog_native_loader_no_marker():
+    assert ps._is_jdog_native_loader(b"com/jdog/JLibrary only") is False
+
+
+def test_is_jdog_native_loader_empty():
+    assert ps._is_jdog_native_loader(b"") is False
+
+
+# ---------------------------------------------------------------------------
+# _dpt_app_stub：dpt stub application 判定
+# ---------------------------------------------------------------------------
+def test_dpt_app_stub_hit():
+    assert ps._dpt_app_stub("com.luoyesiqiu.shell.ProxyApplication") is True
+
+
+def test_dpt_app_stub_miss():
+    assert ps._dpt_app_stub("com.example.MainApplication") is False
+
+
+def test_dpt_app_stub_none():
+    assert ps._dpt_app_stub(None) is False
+
+
+# ---------------------------------------------------------------------------
+# _match_dpt_feature：dpt 主文件匹配（前缀误报防护）
+# ---------------------------------------------------------------------------
+def test_match_dpt_feature_exact():
+    assert ps._match_dpt_feature("assets/i11111i111.zip", "i11111i111.zip") is True
+
+
+def test_match_dpt_feature_prefix_false_positive():
+    assert ps._match_dpt_feature("assets/i11111i111.zip.bak", "i11111i111.zip") is False
+
+
+def test_match_dpt_feature_special_dir():
+    assert ps._match_dpt_feature("assets/OoooooOooo/sub/x", "OoooooOooo") is True
+
+
+# ---------------------------------------------------------------------------
+# _classify_custom_family / _judge_custom_family：自研保护归类
+# ---------------------------------------------------------------------------
+def test_classify_custom_family_jdog():
+    assert ps._classify_custom_family(
+        ["libx.so"], True, {}) == ("jdog_native_dex_loader", "high")
+
+
+def test_classify_custom_family_packhub():
+    dex_info = {"class_names": ["com/packhub/shell/DexLoader"]}
+    assert ps._classify_custom_family([], False, dex_info) == ("packhub_shell", "high")
+
+
+def test_classify_custom_family_none():
+    assert ps._classify_custom_family([], False, {}) == (None, None)
+
+
+def _mk_custom_signals(**over):
+    signals = {
+        "feats": {"asset_payloads": [], "application": None,
+                  "appcomponentfactory": False},
+        "dex_info": {"stub": False,
+                     "dex": [{"name": "classes.dex", "classes": 5000}],
+                     "class_names": []},
+        "so_content": {"jdog_native_loader": [], "non_elf": []},
+        "hidden_dex": [],
+        "malformed_manifest": False,
+        "random_libs": [],
+        "hex_packer_pairs": [],
+        "fake_dex_decoys": [],
+    }
+    signals.update(over)
+    return signals
+
+
+def test_judge_custom_family_jdog_native():
+    r = ps._judge_custom_family(_mk_custom_signals(
+        so_content={"jdog_native_loader": ["libfoo.so"], "non_elf": []},
+        dex_info={"stub": True, "dex": [], "class_names": []},
+    ))
+    assert r["custom_family"] == "jdog_native_dex_loader"
+    assert r["custom_family_confidence"] == "high"
+
+
+def test_judge_custom_family_packhub():
+    r = ps._judge_custom_family(_mk_custom_signals(
+        dex_info={"stub": False,
+                  "dex": [{"name": "classes.dex", "classes": 100}],
+                  "class_names": ["com/packhub/shell/DexLoader"]},
+    ))
+    assert r["custom_family"] == "packhub_shell"
+
+
+def test_judge_custom_family_random_lib_malformed():
+    r = ps._judge_custom_family(_mk_custom_signals(
+        malformed_manifest=True,
+        random_libs=["libGTlNLCpFsvbV.so"],
+    ))
+    assert r["custom_packer_strong"] is True
+    assert r["custom_packer"] is True
+
+
+def test_judge_custom_family_none():
+    r = ps._judge_custom_family(_mk_custom_signals())
+    assert r["custom_family"] is None
+    assert r["custom_packer"] is False
+    assert r["custom_packer_strong"] is False

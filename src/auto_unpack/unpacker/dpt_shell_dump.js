@@ -134,7 +134,14 @@ function dumpFromClassLoader(loader) {
         var PathClassLoader = Java.use("dalvik.system.BaseDexClassLoader");
         var pathListField = PathClassLoader.class.getDeclaredField("pathList");
         pathListField.setAccessible(true);
-        var pathList = pathListField.get(loader);
+        var pathList;
+        try {
+            pathList = pathListField.get(loader);
+        } catch (e2) {
+            // BootClassLoader 等非 BaseDexClassLoader 没有 pathList 字段，跳过即可，
+            // 不必打印错误噪音。
+            return;
+        }
         if (!pathList) return;
         var DexPathList = Java.use("dalvik.system.DexPathList");
         var elementsField = DexPathList.class.getDeclaredField("dexElements");
@@ -145,7 +152,13 @@ function dumpFromClassLoader(loader) {
         console.log("[*] ClassLoader 有 " + len + " 个 dexElement");
         for (var i = 0; i < len; i++) {
             var el = arr.get(elements, i);
-            var df = el.dexFile.value;
+            // 部分 dexElement 的 dexFile 字段为空，判空避免 TypeError 噪音
+            var df = null;
+            try {
+                if (el.dexFile) {
+                    df = el.dexFile.value;
+                }
+            } catch (e2) {}
             if (!df) continue;
             dumpJavaDexFileObj(df);
             try {

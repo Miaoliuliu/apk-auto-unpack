@@ -24,6 +24,8 @@ from .sample import SampleError, ingest
 from .states import (
     COMPLETED,
     DETECTING,
+    E_NO_MANIFEST,
+    E_NOT_ZIP,
     EXTRACTING,
     FAILED,
     NEEDS_REVIEW,
@@ -196,11 +198,17 @@ def _is_not_installed_err(msg: str) -> bool:
 
 def _extract_apk(task: Task) -> None:
     from ..extraction.analyze import extract_indicators, scan_extraction_warnings
-    inds, eps = extract_indicators(task.apk_path)
+    stats: dict = {}
+    inds, eps = extract_indicators(task.apk_path, stats=stats)
     task.urls = inds
     task.endpoints = sorted(eps)
+    task.extraction_stats = stats
     for w in scan_extraction_warnings(task.apk_path, inds):
         task.warn(w)
+    failed = len(stats.get("parse_failed") or []) + len(stats.get("encrypted_dex") or [])
+    failed += len(stats.get("strings_failed") or [])
+    if failed and not inds:
+        task.warn(f"dex 解析失败/加密 {failed} 个，URL 提取结果可能不完整")
 
 
 def _extract_dump(task: Task, dexes: list[Path]) -> tuple[list[dict], dict]:
@@ -252,7 +260,8 @@ def _finish_files(task: Task, meta_extra: dict | None = None, *,
         return
     from ..extraction.analyze import write_url_files, url_rank
     url_dir = Path(task.sample.get("url_dir") or task.out_dir)
-    biz = write_url_files(url_dir, url_set, set(task.endpoints))
+    # 传 task.urls，产物每条 URL 才能带「从哪来」的标注（人工复核用）
+    biz = write_url_files(url_dir, url_set, set(task.endpoints), task.urls)
     ranks = {"noise": 0, "weak": 0, "biz": 0}
     for u in url_set:
         r = url_rank(u)
@@ -757,30 +766,38 @@ def _stage_dyn_unpack(task: Task, apk_s: str, package: str | None,
     return task.to_report()
 
 
-def _cleanup_inbox_source(apk_s: str, task: Task | None) -> None:
-    """归档成功后清理默认 APK 输入目录里的源文件（避免重复跑 + 目录堆积）。
+def _cleanup_inbox_source(apk_s: str, task: Task | dict | None) -> None:
+    """清理默认 APK 输入目录里已经处理完的源文件（避免重复跑 + 目录堆积）。
 
     仅完整 analyze 流程（非 detect_only）结束时调用；detect 只识别不清理源文件。
-    只在以下条件同时满足时才删：
-    1. 归档成功（detect_archive 指向 packer_detection 里的副本，而非源路径本身）；
-    2. 源文件确实在默认 APK/ 输入目录里（不删 --inbox / 直接传的外部文件）。
+    正常 APK 必须先成功归档；接入阶段已明确判定为非 APK/缺少 Manifest 的
+    无效输入没有归档价值，也应从默认收件箱移除。I/O、体积和 ZIP bomb 等
+    其它校验错误仍保留，以免误删可能需要人工处理的样本。
     """
     if task is None:
         return
-    archived = task.sample.get("detect_archive")
-    if not archived:
-        return
     src = Path(apk_s)
-    arch = Path(archived)
-    # 归档被禁用时 archive_detected_apk 返回源路径（未复制），不能删
-    if arch.resolve() == src.resolve():
-        return
+    rejected = False
+    if isinstance(task, dict):
+        code = (task.get("error") or {}).get("code")
+        rejected = code in {E_NOT_ZIP, E_NO_MANIFEST}
+        if not rejected:
+            return
+    else:
+        archived = task.sample.get("detect_archive")
+        if not archived:
+            return
+        arch = Path(archived)
+        # 归档被禁用时 archive_detected_apk 返回源路径（未复制），不能删
+        if arch.resolve() == src.resolve():
+            return
     try:
         from ..runtime.product import default_apk_inbox
         inbox = default_apk_inbox().resolve()
         if src.resolve().parent == inbox:
             src.unlink(missing_ok=True)
-            print(f"[*] 已清理输入目录源文件: {src.name}")
+            reason = "无效输入" if rejected else "已归档"
+            print(f"[*] 已清理输入目录源文件: {src.name}（{reason}）")
     except OSError as e:
         print(f"[警告] 清理源文件失败: {e}")
 
@@ -862,7 +879,7 @@ def run(
     finally:
         # 仅完整 analyze 流程跑完后清理源文件；detect（只识别）保留源文件，供后续再跑全流程
         if not detect_only:
-            _cleanup_inbox_source(apk_s, task if isinstance(task, Task) else None)
+            _cleanup_inbox_source(apk_s, task)
 
 
 def print_cli_report(report: dict, extra_out: str | None = None) -> None:
@@ -890,23 +907,31 @@ def print_cli_report(report: dict, extra_out: str | None = None) -> None:
     dex_dir = (report.get("sample") or {}).get("dex_dir")
     if dex_dir:
         print(f"[+] dex -> {dex_dir}")
+    from ..extraction.analyze import business_urls, format_url_line
     urls = report.get("urls") or []
-    biz = [u.get("value") or u.get("url") for u in urls if u.get("rank") == "biz"]
+    biz = [(u.get("value") or u.get("url"), u.get("sources") or [])
+           for u in urls if u.get("rank") == "biz"]
     print("\n=== 业务 URL ===")
-    for u in biz:
-        print(u)
+    if not biz:
+        print("  （无）")
+    for u, srcs in biz:
+        print("  " + format_url_line(u, srcs))
     if not extra_out:
         return
-    from ..extraction.analyze import business_urls
     url_set = {u.get("value") or u.get("url") for u in urls if u.get("value") or u.get("url")}
+    src_of = {u.get("value") or u.get("url"): (u.get("sources") or []) for u in urls}
     eps = report.get("endpoints") or []
     biz_set = business_urls(url_set)
     out_path = Path(extra_out)
     ep_path = out_path.with_name(out_path.stem + "_endpoints" + out_path.suffix)
     biz_path = out_path.with_name(out_path.stem + "_biz" + out_path.suffix)
     try:
-        out_path.write_text("\n".join(sorted(url_set)) + "\n", encoding="utf-8")
-        biz_path.write_text("\n".join(sorted(biz_set)) + "\n", encoding="utf-8")
+        out_path.write_text(
+            "\n".join(format_url_line(u, src_of.get(u)) for u in sorted(url_set)) + "\n",
+            encoding="utf-8")
+        biz_path.write_text(
+            "\n".join(format_url_line(u, src_of.get(u)) for u in sorted(biz_set)) + "\n",
+            encoding="utf-8")
         ep_path.write_text("\n".join(sorted(eps)) + "\n", encoding="utf-8")
         print(f"[+] 额外完整 URL -> {out_path} ({len(url_set)} 条)")
         print(f"[+] 额外业务 URL -> {biz_path} ({len(biz_set)} 条)")

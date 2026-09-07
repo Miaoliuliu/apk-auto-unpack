@@ -21,22 +21,28 @@ import argparse
 import re
 import sys
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from androguard.core.dex import DEX
 
 from ..dex_utils import fix_dex_header, parse_dexes
 from .indicators import (
+    SOURCE_LABELS,
     _collect_endpoint,
     _harvest_config,
+    _harvest_encoded,
     _harvest_text,
+    _host_of,
     _iter_urls,
     _maybe_harvest_dex_string,
     _scan_raw_for_urls,
     business_urls,
+    display_width,
     fold_related_urls,
     make_indicator,
     merge_indicators,
+    render_url_line,
     url_rank,
     weak_worth_listing,
 )
@@ -232,7 +238,7 @@ def _extract_from_zip_assets(apk_path: str) -> tuple[set[str], set[str]]:
     return urls, endpoints
 
 
-def _load_dex_files(path: Path, head: bytes) -> list[tuple[str, DEX]]:
+def _load_dex_files(path: Path, head: bytes, stats: dict | None = None) -> list[tuple[str, DEX]]:
     """加载 dex：裸 dex（dex\n / dey\n）直接修头；APK 走 parse_dexes（跳过非 ASCII 假 dex，不解析 Manifest）。"""
     if head in (b"dex\n", b"dey\n"):
         # 与 parse_dexes 保持一致：裸 dex 也先做廉价头校验，声明异常
@@ -241,12 +247,16 @@ def _load_dex_files(path: Path, head: bytes) -> list[tuple[str, DEX]]:
 
         data = path.read_bytes()
         if not dex_header_plausible(data):
+            if stats is not None:
+                stats.setdefault("malformed_dex", []).append(path.name)
             return []
         try:
             return [(path.name, DEX(fix_dex_header(data)))]
-        except Exception:
+        except Exception as e:
+            if stats is not None:
+                stats.setdefault("parse_failed", []).append((path.name, str(e)))
             return []
-    return parse_dexes(str(path))
+    return parse_dexes(str(path), stats=stats)
 
 
 def _extract_from_resources_arsc(apk_path: str) -> tuple[set[str], set[str]]:
@@ -295,7 +305,10 @@ def _merge_binary_into_indicators(apk_path: str, *, deep: bool) -> tuple[list[di
 
 
 def extract(apk_path: str) -> tuple[set[str], set[str]]:
-    """extract_indicators 的轻量视图：只要 URL 字符串集（丢出处），独立 CLI 用。"""
+    """extract_indicators 的轻量视图：只要 URL 字符串集（丢出处）。
+
+    保留作兼容入口；本模块 CLI 与各条产物链路已改用 extract_indicators（带出处）。
+    """
     items, endpoints = extract_indicators(apk_path)
     return {i["url"] for i in items if i.get("url")}, endpoints
 
@@ -373,12 +386,15 @@ def _extract_manifest_indicators(apk_path: str) -> list[dict]:
     return items
 
 
-def _extract_dex_string_indicators(dex_files, items: list[dict], endpoints: set[str]) -> None:
+def _extract_dex_string_indicators(dex_files, items: list[dict], endpoints: set[str],
+                                   stats: dict | None = None) -> None:
     """遍历 dex 字符串池提取 URL + 端点（items/endpoints 就地追加）。"""
     for name, dex in dex_files:
         try:
             strings = dex.get_strings()
-        except Exception:
+        except Exception as e:
+            if stats is not None:
+                stats.setdefault("strings_failed", []).append((name, str(e)))
             continue
         for s in strings:
             if not isinstance(s, str):
@@ -392,6 +408,12 @@ def _extract_dex_string_indicators(dex_files, items: list[dict], endpoints: set[
             _maybe_harvest_dex_string(s, harvested, endpoints)
             for u in harvested:
                 ind = make_indicator(u, "dex", name, "harvest")
+                if ind:
+                    items.append(ind)
+            decoded: set[str] = set()
+            _harvest_encoded(s, decoded, endpoints)
+            for u in decoded:
+                ind = make_indicator(u, "dex", name, "decoded")
                 if ind:
                     items.append(ind)
 
@@ -430,16 +452,32 @@ def _extract_apk_indicators(path: Path, items: list[dict], endpoints: set[str]) 
     return merged
 
 
-def extract_indicators(apk_path: str) -> tuple[list[dict], set[str]]:
-    """提取 URL 指标（含出处）。裸 dex 只扫字符串池。"""
+def extract_apk_non_dex_sources(apk_path: str) -> tuple[list[dict], set[str]]:
+    """扫 APK 中 dex 字符串池之外的来源：assets/arsc/native/manifest/binary（含 deep 兜底）。
+
+    与 extract_indicators 的区别：不解析 APK 内 dex 字符串池（壳样本里那只是
+    stub，无业务价值）。供脱壳产物补扫使用——dump 出的 payload dex 走裸 dex
+    路径单独提字符串池，原包里 dpt 壳通常不加密的资源类来源由本函数补上。
+    """
+    endpoints: set[str] = set()
+    items = _extract_apk_indicators(Path(apk_path), [], endpoints)
+    return items, endpoints
+
+
+def extract_indicators(apk_path: str, stats: dict | None = None) -> tuple[list[dict], set[str]]:
+    """提取 URL 指标（含出处）。裸 dex 只扫字符串池。
+
+    stats 可选，收集解析层失败信号（parse_failed / encrypted_dex /
+    malformed_dex / strings_failed），供上层判断结果是否可能不完整。
+    """
     path = Path(apk_path)
     with open(path, "rb") as fh:
         head = fh.read(4)
 
     items: list[dict] = []
     endpoints: set[str] = set()
-    dex_files = _load_dex_files(path, head)
-    _extract_dex_string_indicators(dex_files, items, endpoints)
+    dex_files = _load_dex_files(path, head, stats)
+    _extract_dex_string_indicators(dex_files, items, endpoints, stats)
 
     if head in (b"dex\n", b"dey\n"):
         _extract_bare_dex_indicators(path, items, endpoints)
@@ -552,11 +590,83 @@ def scan_extraction_warnings(apk_path: str, urls=None) -> list[str]:
     return warns
 
 
-def write_url_files(directory: Path, urls: set[str], endpoints: set[str]) -> set[str]:
-    """写出 urls_by_rank.txt（只含相关 URL），返回业务 URL 集合。
+def build_source_index(indicators: list[dict] | None) -> dict[str, list[dict]]:
+    """URL -> 来源列表（按 (type, file, method) 去重，保留首次出现顺序）。
+
+    只按 URL 原文建索引：所有调用点传入的 urls 与 indicators 同源（都来自
+    task.urls），实测原文命中率 100%，不需要额外的合并键兜底。
+    """
+    idx: dict[str, list[dict]] = {}
+    for it in indicators or []:
+        url = it.get("url") or it.get("value")
+        if not url:
+            continue
+        bucket = idx.setdefault(url, [])
+        seen = {(s.get("type"), s.get("file"), s.get("method")) for s in bucket}
+        for s in it.get("sources") or []:
+            sig = (s.get("type"), s.get("file"), s.get("method"))
+            if sig not in seen:
+                bucket.append(dict(s))
+                seen.add(sig)
+    return idx
+
+
+def _source_index_of(url: str, idx: dict[str, list[dict]]) -> list[dict]:
+    return idx.get(url) or []
+
+
+_RULE = "─" * 76
+# 来源列对齐宽度上限：再长的 URL 不再把整表撑开
+_SRC_COL_MAX = 68
+
+
+def _header_lines(name: str, biz: int, weak: int, noise: int,
+                  bare: int, endpoints: int) -> list[str]:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 全部非 URL 行都以 # 开头：文件里「不以 # 开头的行 = URL」，可直接 grep 抽取
+    lines = [
+        f"# {_RULE}",
+        f"#   URL 提取结果 · {name}",
+        f"#   生成时间 {stamp}    静态字面量层（不含运行时观测 / 解密还原）",
+        f"# {_RULE}",
+        "#",
+        f"#   写入     {biz + weak} 条    biz {biz}    weak {weak}",
+        f"#   未写入   noise {noise}    weak 裸域名 {bare}    端点路径 {endpoints}",
+        "#",
+        "#   行格式   <URL>    · <来源类型>/<提取方式>@<文件>",
+        "#   图例",
+    ]
+    for tag, label in sorted(
+        (f"{t}/{m}", lab) for (t, m), lab in SOURCE_LABELS.items()
+    ):
+        lines.append(f"#     {tag:<24} {label}")
+    lines.extend([f"# {_RULE}", "#"])
+    return lines
+
+
+def _render_url_lines(urls: set[str], idx: dict[str, list[dict]]) -> list[str]:
+    """同一档位内按 URL 排序，来源列左对齐（宽度封顶 _SRC_COL_MAX）。"""
+    if not urls:
+        return ["# （无）"]
+    picked = [(u, _source_index_of(u, idx)) for u in sorted(urls)]
+    width = min(max(display_width(u) for u, _ in picked), _SRC_COL_MAX)
+    return [render_url_line(u, srcs, width=width) for u, srcs in picked]
+
+
+def format_url_line(url: str, sources: list[dict] | None = None) -> str:
+    """控制台/额外产物用的单行渲染（固定 68 列对齐）。"""
+    return render_url_line(url, sources, width=_SRC_COL_MAX)
+
+
+def write_url_files(directory: Path, urls: set[str], endpoints: set[str],
+                    indicators: list[dict] | None = None) -> set[str]:
+    """写出 urls_by_rank.txt（只含相关 URL，带来源标注），返回业务 URL 集合。
 
     只写 biz（业务）→ 有信号的 weak；noise / 裸域名 weak / endpoints 不进文件。
     http 与 https、utm locale 变体会折叠。
+
+    indicators 可选，传 task.urls（merge_indicators 的产物）即可补上来源列；
+    不传则来源显示 unknown，老调用方行为不变。
     """
     directory.mkdir(parents=True, exist_ok=True)
     folded = fold_related_urls(urls)
@@ -564,18 +674,17 @@ def write_url_files(directory: Path, urls: set[str], endpoints: set[str]) -> set
     weak = {u for u in folded if u and weak_worth_listing(u)}
     weak_all = sum(1 for u in folded if u and url_rank(u) == "weak")
     noise_n = sum(1 for u in folded if u and url_rank(u) == "noise")
-    lines = [
-        "# URL 提取结果（仅相关：biz / weak）",
-        f"# 写入 biz={len(biz)}  weak={len(weak)}  "
-        f"（未写入 noise={noise_n} weak_bare={weak_all - len(weak)} "
-        f"endpoints={len(endpoints)}）",
-        "",
-        f"## biz（业务）  {len(biz)}",
-    ]
-    lines.extend(sorted(biz) if biz else ["（无）"])
+    idx = build_source_index(indicators)
+
+    lines = _header_lines(
+        directory.name, len(biz), len(weak), noise_n,
+        weak_all - len(weak), len(endpoints),
+    )
+    lines.append(f"## biz（业务）  {len(biz)}")
+    lines.extend(_render_url_lines(biz, idx))
     lines.append("")
     lines.append(f"## weak（弱信号）  {len(weak)}")
-    lines.extend(sorted(weak) if weak else ["（无）"])
+    lines.extend(_render_url_lines(weak, idx))
     lines.append("")
     (directory / "urls_by_rank.txt").write_text("\n".join(lines), encoding="utf-8")
     # 旧分文件不再写；若目录里残留则删掉，避免和单文件重复
@@ -589,17 +698,19 @@ def write_url_files(directory: Path, urls: set[str], endpoints: set[str]) -> set
     return biz
 
 
-def _print_results(urls: set[str], endpoints: set[str]) -> None:
+def _print_results(urls: set[str], endpoints: set[str],
+                   idx: dict[str, list[dict]] | None = None) -> None:
+    idx = idx or {}
     biz = business_urls(urls)
     print("=== 业务 URL ===")
     for u in sorted(biz):
-        print(u)
+        print("  " + format_url_line(u, _source_index_of(u, idx)))
     print("\n=== 全部 URL（含 SDK） ===")
     for u in sorted(urls):
-        print(u)
+        print("  " + format_url_line(u, _source_index_of(u, idx)))
     print("\n=== 端点路径 ===")
     for e in sorted(endpoints):
-        print(e)
+        print("  " + e)
 
 
 def main() -> int:
@@ -615,33 +726,42 @@ def main() -> int:
 
     print(f"[*] 分析: {apk}")
     try:
-        urls, endpoints = extract(str(apk))
+        items, endpoints = extract_indicators(str(apk))
     except Exception as e:
         print(f"[错误] 分析失败: {e}", file=sys.stderr)
         return 2
 
+    urls = {i["url"] for i in items if i.get("url")}
+    idx = build_source_index(items)
     biz = business_urls(urls)
-    print(f"[*] 完整 URL: {len(urls)} 个  业务 URL: {len(biz)} 个  端点路径: {len(endpoints)} 个\n")
+    print(f"[*] 完整 URL: {len(urls)} 个  业务 URL: {len(biz)} 个  端点路径: {len(endpoints)} 个")
+    print("    行格式 <URL>    · <来源类型>/<提取方式>@<文件>\n")
 
     if args.out:
         out_path = Path(args.out)
         ep_path = out_path.with_name(out_path.stem + "_endpoints" + out_path.suffix)
         biz_path = out_path.with_name(out_path.stem + "_biz" + out_path.suffix)
         try:
-            out_path.write_text("\n".join(sorted(urls)) + "\n", encoding="utf-8")
-            biz_path.write_text("\n".join(sorted(biz)) + "\n", encoding="utf-8")
+            out_path.write_text(
+                "\n".join(format_url_line(u, _source_index_of(u, idx))
+                          for u in sorted(urls)) + "\n",
+                encoding="utf-8")
+            biz_path.write_text(
+                "\n".join(format_url_line(u, _source_index_of(u, idx))
+                          for u in sorted(biz)) + "\n",
+                encoding="utf-8")
             ep_path.write_text("\n".join(sorted(endpoints)) + "\n", encoding="utf-8")
             print(f"[+] 完整 URL -> {out_path} ({len(urls)} 条)")
             print(f"[+] 业务 URL -> {biz_path} ({len(biz)} 条)")
             print(f"[+] 端点路径 -> {ep_path} ({len(endpoints)} 条)")
             print("\n=== 业务 URL ===")
             for u in sorted(biz):
-                print(u)
+                print("  " + format_url_line(u, _source_index_of(u, idx)))
         except OSError as e:
             print(f"[警告] 写入文件失败: {e}，改在屏幕输出", file=sys.stderr)
-            _print_results(urls, endpoints)
+            _print_results(urls, endpoints, idx)
     else:
-        _print_results(urls, endpoints)
+        _print_results(urls, endpoints, idx)
 
     return 0
 

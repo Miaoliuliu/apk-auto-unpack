@@ -104,6 +104,7 @@ class Task:
         self.unpacking: dict = {}
         self.urls: list[dict] = []
         self.endpoints: list[str] = []
+        self.extraction_stats: dict = {}
         self.tool_versions: dict = {}
         self.sig: dict = {}
         self.route: str | None = None

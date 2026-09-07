@@ -158,7 +158,7 @@ def analyze_dumped_dexes(dexes: list[Path], apk_path: str | None
 
     返回 (endpoints, rows, quality, indicators)。
     """
-    from ..extraction.analyze import extract_assets_traced, extract_indicators, extract_native
+    from ..extraction.analyze import extract_apk_non_dex_sources, extract_indicators
     from ..extraction.indicators import merge_indicators
     from ..packer.packer_sigs import analyze_dex_structure as dex_analyze
 
@@ -171,12 +171,10 @@ def analyze_dumped_dexes(dexes: list[Path], apk_path: str | None
 
     if apk_path:
         try:
-            traced, ae = extract_assets_traced(apk_path)
-            items.extend(traced)
+            extra, ae = extract_apk_non_dex_sources(apk_path)
+            items.extend(extra)
             endpoints |= ae
-            native = extract_native(apk_path)
-            items.extend(native)
-            print(f"[*] APK 资源补 URL: {len(traced)} 个  端点: {len(ae)} 个  native: {len(native)} 个")
+            print(f"[*] APK 资源补 URL: {len(extra)} 个  端点: {len(ae)} 个")
         except Exception as ex:
             print(f"[警告] APK 资源扫描失败: {ex}")
 

@@ -13,11 +13,11 @@
       1. method_code_stats()：统计「应有代码但 code_item 为空」的方法占比，用于脱壳产物校验。
       2. class_count()：根 dex 类数，用于判定根 classes.dex 是不是壳 stub。
 
-分流（不按 Gen1/Gen2 切，商业壳一二代混用）：
+分流：
   无壳 → 直接提取 URL
   dpt-shell（标准/魔改/内嵌ZIP/疑似，对外同一标签） → dpt 脱壳
   常见厂商壳 → 该厂商脱壳插件
-  该厂商样本带 VMP → 标 VMP，转人工（不提取 URL）
+  该厂商样本带 VMP → 标 VMP，转人工
   自研保护（JDog / packhub / 根 dex stub / 根 dex 读不出） → 转人工分析（不提取 URL）
 
 用法:
@@ -35,6 +35,11 @@ import zipfile
 from pathlib import Path
 
 from ..dex_utils import parse_dexes
+
+
+def _warn(msg: str) -> None:
+    """异常路径轻量告警：识别流程不中断，仅 stderr 留痕便于排障。"""
+    print(f"[警告] {msg}", file=sys.stderr)
 
 
 def _norm_path(p: str) -> str:
@@ -775,8 +780,8 @@ def _detect_dpt_files(files, view: _ApkView) -> tuple[list[str], bool]:
         try:
             manifest_bytes = view.read("AndroidManifest.xml")
             has_appcomponentfactory = b"appComponentFactory" in manifest_bytes
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"manifest appComponentFactory 检测失败: {e}")
     return dpt_shell_files, has_appcomponentfactory
 
 
@@ -795,8 +800,9 @@ def extract_features(view: _ApkView) -> dict:
 
     try:
         asset_payloads = _find_asset_payloads(view)
-    except Exception:
+    except Exception as e:
         asset_payloads = []
+        _warn(f"assets 大块检测失败: {e}")
 
     return {
         "lib_sos": lib_sos,
@@ -1229,8 +1235,9 @@ def _collect_dex_info(apk_path: str, feats: dict) -> tuple[dict, list[str]]:
     """
     try:
         dex_info = analyze_dex_structure(apk_path, light=True, collect_names=True)
-    except Exception:
+    except Exception as e:
         dex_info = {"dex": [], "stub": False, "class_names": None}
+        _warn(f"dex 结构分析失败: {e}")
     # manifest 声明的 Application/Activity 不在任何 dex 里 → 真实 dex 被隐藏/运行时
     # 注入（frida-packing-detector 思路的静态反推）。仅作辅助证据。
     manifest_missing: list[str] = []
@@ -1238,8 +1245,9 @@ def _collect_dex_info(apk_path: str, feats: dict) -> tuple[dict, list[str]]:
         try:
             manifest_missing = _manifest_class_missing(
                 feats["application"], feats.get("activities", []), dex_info["class_names"])
-        except Exception:
+        except Exception as e:
             manifest_missing = []
+            _warn(f"manifest 类存在性检测失败: {e}")
     return dex_info, manifest_missing
 
 
@@ -1259,8 +1267,8 @@ def _collect_so_content(view: _ApkView, dpt_shell_files: list[str]) -> dict:
                       if (n.startswith("lib/") or n.startswith("assets/")) and n.endswith(".so")]
         if so_entries and not dpt_shell_files:
             so_content = _scan_so_content(view, so_entries)
-    except Exception:
-        pass
+    except Exception as e:
+        _warn(f"so 内容扫描失败: {e}")
     return so_content
 
 
@@ -1275,7 +1283,8 @@ def _resolve_package(apk_path: str) -> tuple:
             bool(pinfo.get("package_trusted")),
             pinfo.get("package_note") or "",
         )
-    except Exception:
+    except Exception as e:
+        _warn(f"包名解析失败: {e}")
         return None, None, False, ""
 
 
