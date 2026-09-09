@@ -9,7 +9,8 @@
 阶段：RECEIVED → VALIDATED → DETECTING → (NO_PACKER|PACKER_*) →
       UNPACKING → UNPACKED → EXTRACTING → COMPLETED | NEEDS_REVIEW | FAILED
 
-产物目录写 urls_by_rank.txt（URL 分级清单）以及 meta.json。
+产物目录写 urls_by_rank.txt（完整分级指标）、urls.txt（纯绝对 URL）、
+indicators.jsonl（含来源与验证状态）以及 meta.json。
 packer/apkid.py 是同一套流水线的壳识别口。
 
 run() 已按阶段拆分为私有函数（_stage_*），本模块只保留编排骨架。
@@ -20,6 +21,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from ..extraction.report import failed_report, packed_flag, packer_label
+from ..packer.packer_sigs import dex_unreadable, has_payload_dex
+from ..unpacker.adapters import execute as adapter_execute
+from ..unpacker.adapters import select_adapter
+from ..unpacker.validate import analyze_dumped_dexes, warn_extraction
 from .sample import SampleError, ingest
 from .states import (
     COMPLETED,
@@ -27,27 +33,21 @@ from .states import (
     E_NO_MANIFEST,
     E_NOT_ZIP,
     EXTRACTING,
-    FAILED,
     NEEDS_REVIEW,
     NO_PACKER,
     PACKER_IDENTIFIED,
     PACKER_SUSPECTED,
-    UNPACKED,
-    UNPACKING,
     UNPACK_CORRUPTED,
+    UNPACK_MANUAL,
     UNPACK_NOT_INSTALLED,
     UNPACK_SKIPPED,
     UNPACK_UNSUPPORTED,
-    UNPACK_MANUAL,
+    UNPACKED,
+    UNPACKING,
     VALIDATED,
     Task,
     classify_unpack,
 )
-from ..unpacker.adapters import execute as adapter_execute
-from ..unpacker.adapters import select_adapter
-from ..unpacker.validate import analyze_dumped_dexes, warn_extraction
-from ..packer.packer_sigs import dex_unreadable, has_payload_dex
-from ..extraction.report import exit_code, failed_report, packed_flag, packer_label
 
 
 def _tool_versions() -> dict:
@@ -56,7 +56,7 @@ def _tool_versions() -> dict:
     try:
         import androguard
         out["androguard"] = getattr(androguard, "__version__", "unknown")
-    except Exception:
+    except ImportError:
         pass
     return out
 
@@ -89,7 +89,9 @@ def _packer_status(route: str, sig: dict) -> str:
     if route == "static":
         return "NO_PACKER"
     if route == "unknown":
-        return "PACKER_IDENTIFIED"
+        return "PACKER_SUSPECTED"
+    if route == "ambiguous":
+        return "AMBIGUOUS"
     if sig.get("vmp"):
         return "PACKER_IDENTIFIED"
     if sig.get("dpt_type") == "suspected":
@@ -199,22 +201,45 @@ def _is_not_installed_err(msg: str) -> bool:
 def _extract_apk(task: Task) -> None:
     from ..extraction.analyze import extract_indicators, scan_extraction_warnings
     stats: dict = {}
-    inds, eps = extract_indicators(task.apk_path, stats=stats)
+    validation = getattr(task, "network_validation", {}) or {}
+    inds, eps = extract_indicators(
+        task.apk_path,
+        stats=stats,
+        validate_network=bool(validation.get("enabled")),
+        check_http=bool(validation.get("check_http")),
+        network_timeout=float(validation.get("timeout") or 3.0),
+        allow_private_http=bool(validation.get("allow_private_http")),
+    )
     task.urls = inds
     task.endpoints = sorted(eps)
     task.extraction_stats = stats
     for w in scan_extraction_warnings(task.apk_path, inds):
         task.warn(w)
     failed = len(stats.get("parse_failed") or []) + len(stats.get("encrypted_dex") or [])
-    failed += len(stats.get("strings_failed") or [])
-    if failed and not inds:
-        task.warn(f"dex 解析失败/加密 {failed} 个，URL 提取结果可能不完整")
+    failed += len(stats.get("malformed_dex") or []) + len(stats.get("strings_failed") or [])
+    failed += len(stats.get("source_errors") or [])
+    skipped = len(stats.get("source_skipped") or [])
+    if failed or skipped:
+        task.warn(
+            f"URL 提取存在失败/跳过：失败 {failed}，跳过 {skipped}，结果可能不完整"
+        )
 
 
 def _extract_dump(task: Task, dexes: list[Path]) -> tuple[list[dict], dict]:
     endpoints, rows, quality, items = analyze_dumped_dexes(dexes, task.apk_path)
+    validation = getattr(task, "network_validation", {}) or {}
+    if validation.get("enabled"):
+        from ..extraction.validation import validate_indicators_network
+
+        validate_indicators_network(
+            items,
+            check_http=bool(validation.get("check_http")),
+            timeout=float(validation.get("timeout") or 3.0),
+            allow_private_http=bool(validation.get("allow_private_http")),
+        )
     task.urls = items
     task.endpoints = sorted(endpoints)
+    task.extraction_stats = dict(quality.get("extraction_stats") or {})
     return rows, quality
 
 
@@ -258,7 +283,7 @@ def _finish_files(task: Task, meta_extra: dict | None = None, *,
                 meta["complete_note"] = "跳过动态脱壳"
     if not write_urls:
         return
-    from ..extraction.analyze import write_url_files, url_rank
+    from ..extraction.analyze import url_rank, write_url_files
     url_dir = Path(task.sample.get("url_dir") or task.out_dir)
     # 传 task.urls，产物每条 URL 才能带「从哪来」的标注（人工复核用）
     biz = write_url_files(url_dir, url_set, set(task.endpoints), task.urls)
@@ -272,8 +297,11 @@ def _finish_files(task: Task, meta_extra: dict | None = None, *,
     meta["url_rank"] = ranks
     meta["endpoint_count"] = len(task.endpoints)
     meta["url_dir"] = str(url_dir)
-    print(f"[+] URL（相关）-> {url_dir / 'urls_by_rank.txt'} "
-          f"(biz={len(biz)} weak={ranks.get('weak', 0)}；noise/endpoints 未写入文件)")
+    print(
+        f"[+] URL 指标 -> {url_dir / 'urls_by_rank.txt'} "
+        f"(biz={len(biz)} weak={ranks.get('weak', 0)} noise={ranks.get('noise', 0)})"
+    )
+    print(f"[+] 纯绝对 URL -> {url_dir / 'urls.txt'}")
     task.sample["url_dir"] = str(url_dir)
 
 
@@ -400,7 +428,6 @@ def _stage_detect(task: Task, apk_s: str, *, package: str | None,
                   archive_detect: bool | None) -> bool:
     """阶段 2：壳识别 + APKiD 合并 + packer 组装 + 归档。返回是否继续。"""
     task.advance(DETECTING)
-    from ..packer.packer_sigs import detect as sig_detect
     from ..packer.apkid import (
         EMPTY_APKID,
         classify,
@@ -410,6 +437,7 @@ def _stage_detect(task: Task, apk_s: str, *, package: str | None,
         run_apkid,
         should_run_apkid,
     )
+    from ..packer.packer_sigs import detect as sig_detect
 
     try:
         sig = sig_detect(apk_s)
@@ -820,6 +848,10 @@ def run(
     install: str | None = None,
     detect_only: bool = False,
     archive_detect: bool | None = None,
+    validate_dns: bool = False,
+    validate_http: bool = False,
+    allow_private_http: bool = False,
+    validation_timeout: float = 3.0,
 ) -> dict:
     """跑完整状态机，返回 report 字典（供 CLI 展示与退出码判断）。
 
@@ -834,6 +866,12 @@ def run(
         task = _stage_ingest(apk_s, out_dir, package)
         if isinstance(task, dict):
             return task
+        task.network_validation = {
+            "enabled": bool(validate_dns or validate_http),
+            "check_http": bool(validate_http),
+            "allow_private_http": bool(allow_private_http),
+            "timeout": max(0.2, float(validation_timeout)),
+        }
 
         # 阶段 2：识别 + APKiD 合并 + packer 组装 + 归档
         if not _stage_detect(

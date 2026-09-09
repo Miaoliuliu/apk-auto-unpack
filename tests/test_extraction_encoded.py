@@ -90,3 +90,13 @@ def test_harvest_short_string_skipped():
 
 def test_harvest_hex_url_recovered():
     assert any("hex.samplegray.cn" in u for u in _urls_from(_HEX.encode().hex()))
+
+
+def test_harvest_embedded_base64_token_with_plain_url_also_present():
+    encoded = _b64(_B64)
+    text = f"prefix=https://plain.samplegray.cn/a encoded={encoded} suffix"
+    assert _B64 in _urls_from(text)
+
+
+def test_harvest_nested_base64_two_layers():
+    assert _B64 in _urls_from(_b64(_b64(_B64)))

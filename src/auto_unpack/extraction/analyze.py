@@ -8,8 +8,9 @@
     1. DEX 字符串池：完整 URL + 以 "/" 开头的端点路径
     2. APK 文本资源（Uni-app www/*.js、json、bundle、配置等）
     3. resources.arsc / 原生 .so / 二进制残留（ASCII + UTF-16LE + 裸 IP:port）
-    4. 相关 URL（biz/weak）仍为空时，扩大扫 assets/res/lib 做兜底
-    5. URL 分三档：noise / weak / biz；urls_by_rank.txt 只写 biz → weak
+    4. 始终对 assets/res/lib/无扩展配置做有预算的二进制补扫，不依赖已有命中
+    5. 统一做 URL/host 语法校验；DNS/HTTP 可达性验证需显式启用
+    6. 输出三档完整指标、纯绝对 URL 及带来源/验证状态的 JSONL
 
     业务 URL 漏报时优先改 indicators.py 的「业务提取规则」表（规则全部在那里）。
     裸 dex（文件头 `dex\\n` / `dey\\n`）扫字符串池 + 原始字节；assets 需对原 APK 再扫一遍。
@@ -18,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import zipfile
@@ -25,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 from androguard.core.dex import DEX
+from loguru import logger
 
 from ..dex_utils import fix_dex_header, parse_dexes
 from .indicators import (
@@ -37,14 +40,15 @@ from .indicators import (
     _iter_urls,
     _maybe_harvest_dex_string,
     _scan_raw_for_urls,
+    _weak_has_signal,
     business_urls,
-    display_width,
     fold_related_urls,
+    format_sources,
+    is_syntax_valid_candidate,
     make_indicator,
     merge_indicators,
     render_url_line,
     url_rank,
-    weak_worth_listing,
 )
 
 # 注：HiddenApiClassDataItem.DomapiApiFlag 的兼容 patch 在 dex_utils.py 模块顶层
@@ -60,14 +64,74 @@ _SKIP_ASSET_SUBSTR = (
     "chunk-vendors", "/polyfill", "jweixin", "weixin-js-sdk",
     "sensorsdata", "uview.ui",
 )
-_SKIP_ASSET_NAMES = ("androidmanifest.xml", "public.xml", "ids.xml")
+_SKIP_ASSET_NAMES = (
+    "androidmanifest.xml", "public.xml", "ids.xml",
+    "keyword.txt", "bad_domains.txt", "t-rex.html",
+)
+_SKIP_LIST_FILES = frozenset({
+    "keyword.txt", "bad_domains.txt", "t-rex.html",
+})
 _MAX_ASSET_BYTES = 12 * 1024 * 1024
 # 全包二进制回扫：单文件上限（避免把超大 so/视频整读）
 _MAX_BINARY_SCAN_BYTES = 24 * 1024 * 1024
+_MAX_TOTAL_READ_BYTES = 512 * 1024 * 1024
+_MAX_MEMBER_READS = 20_000
+_MAX_COMPRESSION_RATIO = 200
 _BINARY_ALWAYS_SUFFIX = (
     ".dex", ".so", ".arsc", ".bin", ".dat", ".cfg", ".json", ".js",
     ".properties", ".xml", ".txt", ".bundle",
 )
+
+
+def _new_scan_budget() -> dict:
+    return {"read_bytes": 0, "member_reads": 0}
+
+
+def _record_source_error(stats: dict | None, source: str, file: str, exc) -> None:
+    entry = {"source": source, "file": file, "error": str(exc)[:500]}
+    if stats is not None:
+        stats.setdefault("source_errors", []).append(entry)
+    logger.warning("URL source scan failed: {source}/{file}: {error}", **entry)
+
+
+def _record_skip(stats: dict | None, source: str, file: str, reason: str) -> None:
+    if stats is None:
+        return
+    bucket = stats.setdefault("source_skipped", [])
+    if len(bucket) < 500:
+        bucket.append({"source": source, "file": file, "reason": reason})
+
+
+def _read_member(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    *,
+    source: str,
+    max_bytes: int,
+    stats: dict | None,
+    budget: dict | None,
+) -> bytes | None:
+    if info.file_size > max_bytes:
+        _record_skip(stats, source, info.filename, "member_too_large")
+        return None
+    ratio = info.file_size / max(info.compress_size, 1)
+    if ratio > _MAX_COMPRESSION_RATIO:
+        _record_skip(stats, source, info.filename, "compression_ratio_exceeded")
+        return None
+    if budget is not None:
+        if budget["member_reads"] >= _MAX_MEMBER_READS:
+            _record_skip(stats, source, info.filename, "member_read_budget_exhausted")
+            return None
+        if budget["read_bytes"] + info.file_size > _MAX_TOTAL_READ_BYTES:
+            _record_skip(stats, source, info.filename, "byte_budget_exhausted")
+            return None
+        budget["member_reads"] += 1
+        budget["read_bytes"] += info.file_size
+    try:
+        return zf.read(info)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, source, info.filename, exc)
+        return None
 
 
 def _has_relevant_url(urls) -> bool:
@@ -78,68 +142,86 @@ def _has_relevant_url(urls) -> bool:
     return False
 
 
+def _is_junk_list_file(base: str) -> bool:
+    if base in _SKIP_LIST_FILES:
+        return True
+    return "emoji" in base and base.endswith((".xml", ".json"))
+
+
 def _should_binary_scan_entry(name: str, size: int, deep: bool) -> bool:
     if size < 32 or size > _MAX_BINARY_SCAN_BYTES:
         return False
     low = name.replace("\\", "/").lower()
     base = low.rsplit("/", 1)[-1]
+    if _is_junk_list_file(base):
+        return False
     if base in ("resources.arsc", "androidmanifest.xml"):
         return True
     if any(low.endswith(suf) for suf in _BINARY_ALWAYS_SUFFIX):
         return True
-    if deep and (low.startswith("assets/") or low.startswith("res/")
-                 or low.startswith("lib/") or "www/" in low):
-        return True
-    return False
+    return deep and (low.startswith(("assets/", "res/", "lib/")) or "www/" in low)
 
 
-_PRINTABLE = re.compile(rb"[\x20-\x7e]{12,512}")
+_PRINTABLE = re.compile(rb"[\x20-\x7e]{12,}")
+_PRINTABLE_WINDOW = 64 * 1024
+_PRINTABLE_OVERLAP = 2048
 _MAX_SO_BYTES = 32 * 1024 * 1024
 _MAX_SO_FILES = 48
 
 
-def extract_native(apk_path: str) -> list[dict]:
+def _iter_printable_text(raw: bytes):
+    """以有界窗口产出可打印区域，窗口间保留一个最大 URL 长度的重叠。"""
+    for match in _PRINTABLE.finditer(raw):
+        start, end = match.span()
+        while start < end:
+            window_end = min(start + _PRINTABLE_WINDOW, end)
+            yield raw[start:window_end].decode("ascii", errors="ignore")
+            if window_end == end:
+                break
+            start = window_end - _PRINTABLE_OVERLAP
+
+
+def extract_native(
+    apk_path: str,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> list[dict]:
     """从 APK 内 .so 扫可打印串里的 URL 和内嵌配置（"url": "host" 等）。不做解密。"""
     out: list[dict] = []
     try:
         zf = zipfile.ZipFile(apk_path)
-    except Exception:
+    except (OSError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, "native", apk_path, exc)
         return out
     n_so = 0
     with zf:
-        for name in zf.namelist():
+        for info in zf.infolist():
+            name = info.filename
             low = name.replace("\\", "/").lower()
             if not low.endswith(".so"):
                 continue
+            if info.file_size > _MAX_SO_BYTES or info.file_size < 64:
+                _record_skip(stats, "native", name, "member_size_out_of_range")
+                continue
             n_so += 1
             if n_so > _MAX_SO_FILES:
-                break
-            try:
-                info = zf.getinfo(name)
-            except KeyError:
+                _record_skip(stats, "native", name, "native_file_limit")
                 continue
-            if info.file_size > _MAX_SO_BYTES or info.file_size < 64:
-                continue
-            try:
-                raw = zf.read(name)
-            except Exception:
-                continue
-            text = "\n".join(
-                m.group(0).decode("ascii", errors="ignore")
-                for m in _PRINTABLE.finditer(raw)
+            raw = _read_member(
+                zf, info, source="native", max_bytes=_MAX_SO_BYTES,
+                stats=stats, budget=budget,
             )
-            if not text:
+            if raw is None:
                 continue
             found: set[str] = set()
-            for u in _iter_urls(text):
-                found.add(u)
-            # Go/Flutter 二进制里常内嵌 JSON 配置（"url": "im.xxx.com"），值本身没有
-            # scheme，靠配置收割规则还原；噪音由 _normalize_base/is_noise_url 过滤
-            harvested: set[str] = set()
-            dummy: set[str] = set()
-            _harvest_config(text, harvested, dummy)
-            for u in harvested:
-                found.add(u)
+            for text in _iter_printable_text(raw):
+                for u in _iter_urls(text):
+                    found.add(u)
+                # Go/Flutter 二进制里常内嵌 JSON 配置。
+                harvested: set[str] = set()
+                dummy: set[str] = set()
+                _harvest_config(text, harvested, dummy)
+                found.update(harvested)
             for u in found:
                 ind = make_indicator(u, "native", name, "so_string")
                 if ind:
@@ -163,31 +245,31 @@ def _looks_binary(raw: bytes) -> bool:
     return b"\x00" in raw[:1024] and raw.count(b"\x00") > 8
 
 
-def _extract_apk_binary_urls(apk_path: str, *, deep: bool = False
-                             ) -> tuple[set[str], set[str]]:
+def _extract_apk_binary_urls(
+    apk_path: str,
+    *,
+    deep: bool = False,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> tuple[set[str], set[str]]:
     """按后缀/深度从 APK 成员二进制抠 URL。deep=True 时扩大到 assets/res/lib。"""
     urls: set[str] = set()
     endpoints: set[str] = set()
     try:
         zf = zipfile.ZipFile(apk_path)
-    except Exception:
+    except (OSError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, "binary", apk_path, exc)
         return urls, endpoints
     with zf:
-        for name in zf.namelist():
-            try:
-                info = zf.getinfo(name)
-            except KeyError:
-                continue
+        for info in zf.infolist():
+            name = info.filename
             if not _should_binary_scan_entry(name, info.file_size, deep):
                 continue
-            # 文本资源已由 _extract_from_zip_assets 覆盖；浅扫时跳过纯文本后缀
-            low = name.replace("\\", "/").lower()
-            if (not deep and low.endswith(_ASSET_EXTS)
-                    and not low.endswith((".xml", ".dat", ".cfg", ".bin"))):
-                continue
-            try:
-                raw = zf.read(name)
-            except Exception:
+            raw = _read_member(
+                zf, info, source="binary", max_bytes=_MAX_BINARY_SCAN_BYTES,
+                stats=stats, budget=budget,
+            )
+            if raw is None:
                 continue
             for u in _scan_raw_for_urls(raw):
                 urls.add(u)
@@ -202,33 +284,40 @@ def _skip_asset(low_path: str) -> bool:
     base = low_path.rsplit("/", 1)[-1]
     if base.startswith("__uniapp") or base in _SKIP_ASSET_NAMES:
         return True
+    if _is_junk_list_file(base):
+        return True
     return any(s in low_path for s in _SKIP_ASSET_SUBSTR)
 
 
-def _extract_from_zip_assets(apk_path: str) -> tuple[set[str], set[str]]:
+def _extract_from_zip_assets(
+    apk_path: str,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> tuple[set[str], set[str]]:
     """扫 APK 内文本资源。Uni-app 业务 API 在 www/*.js，不在 dex。"""
     urls: set[str] = set()
     endpoints: set[str] = set()
     try:
         zf = zipfile.ZipFile(apk_path)
-    except Exception:
+    except (OSError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, "assets", apk_path, exc)
         return urls, endpoints
     with zf:
-        for name in zf.namelist():
+        for info in zf.infolist():
+            name = info.filename
             low = name.replace("\\", "/").lower()
             if not low.endswith(_ASSET_EXTS):
                 continue
             if _skip_asset(low):
                 continue
-            try:
-                info = zf.getinfo(name)
-            except KeyError:
-                continue
             if info.file_size > _MAX_ASSET_BYTES:
+                _record_skip(stats, "assets", name, "member_too_large")
                 continue
-            try:
-                raw = zf.read(name)
-            except Exception:
+            raw = _read_member(
+                zf, info, source="assets", max_bytes=_MAX_ASSET_BYTES,
+                stats=stats, budget=budget,
+            )
+            if raw is None:
                 continue
             if _looks_binary(raw):
                 continue
@@ -252,23 +341,34 @@ def _load_dex_files(path: Path, head: bytes, stats: dict | None = None) -> list[
             return []
         try:
             return [(path.name, DEX(fix_dex_header(data)))]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - androguard exposes no stable exception base
             if stats is not None:
                 stats.setdefault("parse_failed", []).append((path.name, str(e)))
             return []
     return parse_dexes(str(path), stats=stats)
 
 
-def _extract_from_resources_arsc(apk_path: str) -> tuple[set[str], set[str]]:
+def _extract_from_resources_arsc(
+    apk_path: str,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> tuple[set[str], set[str]]:
     """扫 resources.arsc。部分样本把 API 只写在资源字符串池，不进 dex。"""
     urls: set[str] = set()
     endpoints: set[str] = set()
     try:
         with zipfile.ZipFile(apk_path) as zf:
-            raw = zf.read("resources.arsc")
-    except Exception:
+            info = zf.getinfo("resources.arsc")
+            raw = _read_member(
+                zf, info, source="resources", max_bytes=_MAX_ASSET_BYTES,
+                stats=stats, budget=budget,
+            )
+    except KeyError:
         return urls, endpoints
-    if not raw or len(raw) > _MAX_ASSET_BYTES:
+    except (OSError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, "resources", apk_path, exc)
+        return urls, endpoints
+    if not raw:
         return urls, endpoints
     urls |= _scan_raw_for_urls(raw)
     # 再按 NUL 切开的 UTF-8 片段做配置键收割（端点等）
@@ -283,8 +383,12 @@ def _extract_from_resources_arsc(apk_path: str) -> tuple[set[str], set[str]]:
     return urls, endpoints
 
 
-def _extract_resources_arsc_traced(apk_path: str) -> tuple[list[dict], set[str]]:
-    urls, endpoints = _extract_from_resources_arsc(apk_path)
+def _extract_resources_arsc_traced(
+    apk_path: str,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> tuple[list[dict], set[str]]:
+    urls, endpoints = _extract_from_resources_arsc(apk_path, stats, budget)
     items = []
     for u in urls:
         ind = make_indicator(u, "resources", "resources.arsc", "string_pool")
@@ -293,8 +397,16 @@ def _extract_resources_arsc_traced(apk_path: str) -> tuple[list[dict], set[str]]
     return items, endpoints
 
 
-def _merge_binary_into_indicators(apk_path: str, *, deep: bool) -> tuple[list[dict], set[str]]:
-    urls, endpoints = _extract_apk_binary_urls(apk_path, deep=deep)
+def _merge_binary_into_indicators(
+    apk_path: str,
+    *,
+    deep: bool,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> tuple[list[dict], set[str]]:
+    urls, endpoints = _extract_apk_binary_urls(
+        apk_path, deep=deep, stats=stats, budget=budget,
+    )
     items = []
     method = "binary_deep" if deep else "binary"
     for u in urls:
@@ -313,30 +425,35 @@ def extract(apk_path: str) -> tuple[set[str], set[str]]:
     return {i["url"] for i in items if i.get("url")}, endpoints
 
 
-def extract_assets_traced(apk_path: str) -> tuple[list[dict], set[str]]:
+def extract_assets_traced(
+    apk_path: str,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> tuple[list[dict], set[str]]:
     """扫 APK 文本资源，每条 URL 带 zip 内路径（脱壳后的裸 dex 没有 assets，用原包补）。"""
     items: list[dict] = []
     endpoints: set[str] = set()
     try:
         zf = zipfile.ZipFile(apk_path)
-    except Exception:
+    except (OSError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, "assets", apk_path, exc)
         return items, endpoints
     with zf:
-        for name in zf.namelist():
+        for info in zf.infolist():
+            name = info.filename
             low = name.replace("\\", "/").lower()
             if not low.endswith(_ASSET_EXTS):
                 continue
             if _skip_asset(low):
                 continue
-            try:
-                info = zf.getinfo(name)
-            except KeyError:
-                continue
             if info.file_size > _MAX_ASSET_BYTES:
+                _record_skip(stats, "assets", name, "member_too_large")
                 continue
-            try:
-                raw = zf.read(name)
-            except Exception:
+            raw = _read_member(
+                zf, info, source="assets", max_bytes=_MAX_ASSET_BYTES,
+                stats=stats, budget=budget,
+            )
+            if raw is None:
                 continue
             if _looks_binary(raw):
                 continue
@@ -352,13 +469,26 @@ def extract_assets_traced(apk_path: str) -> tuple[list[dict], set[str]]:
     return items, endpoints
 
 
-def _extract_manifest_indicators(apk_path: str) -> list[dict]:
+def _extract_manifest_indicators(
+    apk_path: str,
+    stats: dict | None = None,
+    budget: dict | None = None,
+) -> list[dict]:
     """从 AndroidManifest.xml 抽 URL（二进制 AXML 转 XML 后再扫字符串）。"""
     items: list[dict] = []
     try:
         with zipfile.ZipFile(apk_path) as z:
-            raw = z.read("AndroidManifest.xml")
-    except Exception:
+            info = z.getinfo("AndroidManifest.xml")
+            raw = _read_member(
+                z, info, source="manifest", max_bytes=_MAX_ASSET_BYTES,
+                stats=stats, budget=budget,
+            )
+    except KeyError:
+        return items
+    except (OSError, zipfile.BadZipFile) as exc:
+        _record_source_error(stats, "manifest", apk_path, exc)
+        return items
+    if raw is None:
         return items
     chunks: list[str] = []
     try:
@@ -369,8 +499,8 @@ def _extract_manifest_indicators(apk_path: str) -> list[dict]:
             xml = xml.decode("utf-8", errors="replace")
         if xml:
             chunks.append(xml)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - androguard exceptions vary by version
+        _record_source_error(stats, "manifest_axml", "AndroidManifest.xml", exc)
     chunks.append(raw.decode("utf-8", errors="ignore"))
     chunks.append(raw.decode("utf-16le", errors="ignore"))
     text = "\n".join(chunks)
@@ -392,7 +522,7 @@ def _extract_dex_string_indicators(dex_files, items: list[dict], endpoints: set[
     for name, dex in dex_files:
         try:
             strings = dex.get_strings()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - androguard exceptions vary by version
             if stats is not None:
                 stats.setdefault("strings_failed", []).append((name, str(e)))
             continue
@@ -418,54 +548,95 @@ def _extract_dex_string_indicators(dex_files, items: list[dict], endpoints: set[
                     items.append(ind)
 
 
-def _extract_bare_dex_indicators(path: Path, items: list[dict], endpoints: set[str]) -> None:
+def _extract_bare_dex_indicators(
+    path: Path,
+    items: list[dict],
+    endpoints: set[str],
+    stats: dict | None = None,
+) -> None:
     """裸 dex：字符串池之外再扫原始字节。"""
     try:
         for u in _scan_raw_for_urls(path.read_bytes()):
             ind = make_indicator(u, "dex", path.name, "raw_bytes")
             if ind:
                 items.append(ind)
-    except OSError:
-        pass
+    except OSError as exc:
+        _record_source_error(stats, "dex_raw", path.name, exc)
 
 
-def _extract_apk_indicators(path: Path, items: list[dict], endpoints: set[str]) -> list[dict]:
-    """zip APK：assets/arsc/native/manifest + 二进制浅扫；无相关 URL 时 deep 回扫。"""
-    traced, ae = extract_assets_traced(str(path))
+def _extract_apk_indicators(
+    path: Path,
+    items: list[dict],
+    endpoints: set[str],
+    stats: dict | None = None,
+) -> list[dict]:
+    """ZIP APK：专用解析与确定性的全覆盖二进制扫描，覆盖度不依赖已有命中。"""
+    budget = _new_scan_budget()
+    traced, ae = extract_assets_traced(str(path), stats, budget)
     items.extend(traced)
     endpoints |= ae
-    arsc_items, arsc_ep = _extract_resources_arsc_traced(str(path))
+    arsc_items, arsc_ep = _extract_resources_arsc_traced(str(path), stats, budget)
     items.extend(arsc_items)
     endpoints |= arsc_ep
-    items.extend(extract_native(str(path)))
-    items.extend(_extract_manifest_indicators(str(path)))
-    # 浅扫二进制（dex/so 等），与字符串池互补
-    bin_items, bin_ep = _merge_binary_into_indicators(str(path), deep=False)
+    items.extend(extract_native(str(path), stats, budget))
+    items.extend(_extract_manifest_indicators(str(path), stats, budget))
+    # 始终覆盖 assets/res/lib/无扩展配置；不能因先发现一条 URL 就缩小扫描面。
+    bin_items, bin_ep = _merge_binary_into_indicators(
+        str(path), deep=True, stats=stats, budget=budget,
+    )
     items.extend(bin_items)
     endpoints |= bin_ep
-    merged = merge_indicators(items)
-    if not _has_relevant_url(merged):
-        deep_items, deep_ep = _merge_binary_into_indicators(str(path), deep=True)
-        items.extend(deep_items)
-        endpoints |= deep_ep
-        merged = merge_indicators(items)
-    return merged
+    if stats is not None:
+        stats["scan_budget"] = dict(budget)
+    return merge_indicators(items)
 
 
-def extract_apk_non_dex_sources(apk_path: str) -> tuple[list[dict], set[str]]:
-    """扫 APK 中 dex 字符串池之外的来源：assets/arsc/native/manifest/binary（含 deep 兜底）。
+def extract_apk_non_dex_sources(
+    apk_path: str,
+    stats: dict | None = None,
+) -> tuple[list[dict], set[str]]:
+    """扫 APK 中 dex 字符串池之外的来源：assets/arsc/native/manifest/binary（全覆盖补扫）。
 
     与 extract_indicators 的区别：不解析 APK 内 dex 字符串池（壳样本里那只是
     stub，无业务价值）。供脱壳产物补扫使用——dump 出的 payload dex 走裸 dex
     路径单独提字符串池，原包里 dpt 壳通常不加密的资源类来源由本函数补上。
     """
     endpoints: set[str] = set()
-    items = _extract_apk_indicators(Path(apk_path), [], endpoints)
+    items = _extract_apk_indicators(Path(apk_path), [], endpoints, stats)
     return items, endpoints
 
 
-def extract_indicators(apk_path: str, stats: dict | None = None) -> tuple[list[dict], set[str]]:
-    """提取 URL 指标（含出处）。裸 dex 只扫字符串池。
+def _finalize_indicators(
+    items: list[dict],
+    *,
+    validate_network: bool,
+    check_http: bool,
+    network_timeout: float,
+    allow_private_http: bool,
+) -> list[dict]:
+    merged = merge_indicators(items)
+    if validate_network or check_http:
+        from .validation import validate_indicators_network
+
+        validate_indicators_network(
+            merged,
+            check_http=check_http,
+            timeout=network_timeout,
+            allow_private_http=allow_private_http,
+        )
+    return merged
+
+
+def extract_indicators(
+    apk_path: str,
+    stats: dict | None = None,
+    *,
+    validate_network: bool = False,
+    check_http: bool = False,
+    network_timeout: float = 3.0,
+    allow_private_http: bool = False,
+) -> tuple[list[dict], set[str]]:
+    """提取 URL 指标（含出处）。裸 DEX 扫字符串池及原始字节。
 
     stats 可选，收集解析层失败信号（parse_failed / encrypted_dex /
     malformed_dex / strings_failed），供上层判断结果是否可能不完整。
@@ -480,10 +651,23 @@ def extract_indicators(apk_path: str, stats: dict | None = None) -> tuple[list[d
     _extract_dex_string_indicators(dex_files, items, endpoints, stats)
 
     if head in (b"dex\n", b"dey\n"):
-        _extract_bare_dex_indicators(path, items, endpoints)
-        return merge_indicators(items), endpoints
+        _extract_bare_dex_indicators(path, items, endpoints, stats)
+        return _finalize_indicators(
+            items,
+            validate_network=validate_network,
+            check_http=check_http,
+            network_timeout=network_timeout,
+            allow_private_http=allow_private_http,
+        ), endpoints
 
-    return _extract_apk_indicators(path, items, endpoints), endpoints
+    items = _extract_apk_indicators(path, items, endpoints, stats)
+    return _finalize_indicators(
+        items,
+        validate_network=validate_network,
+        check_http=check_http,
+        network_timeout=network_timeout,
+        allow_private_http=allow_private_http,
+    ), endpoints
 
 
 _ENC_NAME_HINTS = ("config", "dconfig", "version", "cfg", "appconfig", "setting")
@@ -566,11 +750,13 @@ def scan_extraction_warnings(apk_path: str, urls=None) -> list[str]:
                     continue
                 try:
                     raw = z.read(name)
-                except Exception:
+                except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+                    logger.warning("Encrypted-config probe failed for {}: {}", name, exc)
                     continue
                 if _looks_encrypted_blob(raw):
                     encrypted = True
-    except Exception:
+    except (OSError, zipfile.BadZipFile) as exc:
+        logger.warning("Extraction-warning scan failed for {}: {}", apk_path, exc)
         return warns
 
     biz = _has_biz_url(urls)
@@ -621,8 +807,9 @@ _SRC_COL_MAX = 68
 
 
 def _header_lines(name: str, biz: int, weak: int, noise: int,
-                  bare: int, endpoints: int) -> list[str]:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                  endpoints: int, *, bare_weak: int = 0) -> list[str]:
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+    listed = biz + weak
     # 全部非 URL 行都以 # 开头：文件里「不以 # 开头的行 = URL」，可直接 grep 抽取
     lines = [
         f"# {_RULE}",
@@ -630,10 +817,10 @@ def _header_lines(name: str, biz: int, weak: int, noise: int,
         f"#   生成时间 {stamp}    静态字面量层（不含运行时观测 / 解密还原）",
         f"# {_RULE}",
         "#",
-        f"#   写入     {biz + weak} 条    biz {biz}    weak {weak}",
-        f"#   未写入   noise {noise}    weak 裸域名 {bare}    端点路径 {endpoints}",
+        f"#   写入     {listed} 条    biz {biz}    weak {weak}",
+        f"#   未写入   noise {noise}    weak 裸域名 {bare_weak}    端点路径 {endpoints}",
         "#",
-        "#   行格式   <URL>    · <来源类型>/<提取方式>@<文件>",
+        "#   行格式   来源为注释，下一条非注释行是未经协议猜测的原始网络指标",
         "#   图例",
     ]
     for tag, label in sorted(
@@ -645,12 +832,14 @@ def _header_lines(name: str, biz: int, weak: int, noise: int,
 
 
 def _render_url_lines(urls: set[str], idx: dict[str, list[dict]]) -> list[str]:
-    """同一档位内按 URL 排序，来源列左对齐（宽度封顶 _SRC_COL_MAX）。"""
+    """来源写在注释行；所有非注释行保持为纯指标值，便于下游直接读取。"""
     if not urls:
         return ["# （无）"]
-    picked = [(u, _source_index_of(u, idx)) for u in sorted(urls)]
-    width = min(max(display_width(u) for u, _ in picked), _SRC_COL_MAX)
-    return [render_url_line(u, srcs, width=width) for u, srcs in picked]
+    lines: list[str] = []
+    for url in sorted(urls):
+        lines.append(f"# source: {format_sources(_source_index_of(url, idx))}")
+        lines.append(url)
+    return lines
 
 
 def format_url_line(url: str, sources: list[dict] | None = None) -> str:
@@ -660,25 +849,36 @@ def format_url_line(url: str, sources: list[dict] | None = None) -> str:
 
 def write_url_files(directory: Path, urls: set[str], endpoints: set[str],
                     indicators: list[dict] | None = None) -> set[str]:
-    """写出 urls_by_rank.txt（只含相关 URL，带来源标注），返回业务 URL 集合。
+    """写出分级清单与 JSONL。urls_by_rank.txt 只写 biz 和有信号的 weak。
 
-    只写 biz（业务）→ 有信号的 weak；noise / 裸域名 weak / endpoints 不进文件。
-    http 与 https、utm locale 变体会折叠。
-
-    indicators 可选，传 task.urls（merge_indicators 的产物）即可补上来源列；
-    不传则来源显示 unknown，老调用方行为不变。
+    noise / 裸域名 weak 只计个数，不进清单。无协议 host 不写进 urls.txt。
     """
     directory.mkdir(parents=True, exist_ok=True)
-    folded = fold_related_urls(urls)
-    biz = {u for u in folded if u and url_rank(u) == "biz"}
-    weak = {u for u in folded if u and weak_worth_listing(u)}
-    weak_all = sum(1 for u in folded if u and url_rank(u) == "weak")
-    noise_n = sum(1 for u in folded if u and url_rank(u) == "noise")
+    folded = {u for u in fold_related_urls(urls) if is_syntax_valid_candidate(u)}
+    rank_by: dict[str, str] = {}
+    for it in indicators or []:
+        raw = it.get("url") or it.get("value") or ""
+        if not raw:
+            continue
+        r = it.get("rank") or url_rank(raw)
+        prev = rank_by.get(raw)
+        if prev is None or {"biz": 2, "weak": 1, "noise": 0}.get(r, 0) > {
+            "biz": 2, "weak": 1, "noise": 0,
+        }.get(prev, 0):
+            rank_by[raw] = r
+
+    def _rank(u: str) -> str:
+        return rank_by.get(u) or url_rank(u)
+
+    biz = {u for u in folded if u and _rank(u) == "biz"}
+    all_weak = {u for u in folded if u and _rank(u) == "weak"}
+    weak = {u for u in all_weak if _weak_has_signal(u)}
+    noise = {u for u in folded if u and _rank(u) == "noise"}
     idx = build_source_index(indicators)
 
     lines = _header_lines(
-        directory.name, len(biz), len(weak), noise_n,
-        weak_all - len(weak), len(endpoints),
+        directory.name, len(biz), len(weak), len(noise), len(endpoints),
+        bare_weak=len(all_weak) - len(weak),
     )
     lines.append(f"## biz（业务）  {len(biz)}")
     lines.extend(_render_url_lines(biz, idx))
@@ -687,8 +887,28 @@ def write_url_files(directory: Path, urls: set[str], endpoints: set[str],
     lines.extend(_render_url_lines(weak, idx))
     lines.append("")
     (directory / "urls_by_rank.txt").write_text("\n".join(lines), encoding="utf-8")
-    # 旧分文件不再写；若目录里残留则删掉，避免和单文件重复
-    for legacy in ("urls.txt", "urls_biz.txt", "urls_weak.txt", "endpoints.txt"):
+
+    absolute_urls = sorted(u for u in folded if re.match(r"^(?:https?|wss?)://", u, re.IGNORECASE))
+    (directory / "urls.txt").write_text(
+        "\n".join(absolute_urls) + ("\n" if absolute_urls else ""),
+        encoding="utf-8",
+    )
+    source_rows = indicators or [
+        item for u in sorted(folded)
+        if (item := make_indicator(u, "unknown", "", "unknown")) is not None
+    ]
+    rows = [
+        item for item in source_rows
+        if is_syntax_valid_candidate(
+            item.get("canonical") or item.get("url") or item.get("value") or ""
+        )
+    ]
+    (directory / "indicators.jsonl").write_text(
+        "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows),
+        encoding="utf-8",
+    )
+
+    for legacy in ("urls_biz.txt", "urls_weak.txt", "endpoints.txt"):
         old = directory / legacy
         if old.is_file():
             try:
@@ -717,6 +937,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="静态分析 APK/裸 dex，提取 URL 和端点路径")
     parser.add_argument("apk", help="APK 或裸 dex 文件路径")
     parser.add_argument("-o", "--out", help="输出文件路径（URL 写到这里，端点写到 <name>_endpoints<ext>）")
+    parser.add_argument("--validate-dns", action="store_true", help="对 host 做 DNS 解析并记录状态")
+    parser.add_argument("--validate-http", action="store_true", help="显式发起 HTTP HEAD（同时启用 DNS）")
+    parser.add_argument("--allow-private-http", action="store_true",
+                        help="允许 HTTP 探测私有/保留地址；默认阻止")
+    parser.add_argument("--validation-timeout", type=float, default=3.0,
+                        help="单个 HTTP 连接/响应超时秒数（默认 3；DNS 由系统解析器控制）")
     args = parser.parse_args()
 
     apk = Path(args.apk)
@@ -726,8 +952,14 @@ def main() -> int:
 
     print(f"[*] 分析: {apk}")
     try:
-        items, endpoints = extract_indicators(str(apk))
-    except Exception as e:
+        items, endpoints = extract_indicators(
+            str(apk),
+            validate_network=args.validate_dns or args.validate_http,
+            check_http=args.validate_http,
+            network_timeout=max(0.2, args.validation_timeout),
+            allow_private_http=args.allow_private_http,
+        )
+    except Exception as e:  # noqa: BLE001 - CLI boundary reports unexpected failures
         print(f"[错误] 分析失败: {e}", file=sys.stderr)
         return 2
 
@@ -741,19 +973,24 @@ def main() -> int:
         out_path = Path(args.out)
         ep_path = out_path.with_name(out_path.stem + "_endpoints" + out_path.suffix)
         biz_path = out_path.with_name(out_path.stem + "_biz" + out_path.suffix)
+        jsonl_path = out_path.with_name(out_path.stem + "_indicators.jsonl")
         try:
             out_path.write_text(
-                "\n".join(format_url_line(u, _source_index_of(u, idx))
-                          for u in sorted(urls)) + "\n",
+                "\n".join(sorted(urls)) + ("\n" if urls else ""),
                 encoding="utf-8")
             biz_path.write_text(
-                "\n".join(format_url_line(u, _source_index_of(u, idx))
-                          for u in sorted(biz)) + "\n",
+                "\n".join(sorted(biz)) + ("\n" if biz else ""),
                 encoding="utf-8")
             ep_path.write_text("\n".join(sorted(endpoints)) + "\n", encoding="utf-8")
+            jsonl_path.write_text(
+                "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                        for item in items),
+                encoding="utf-8",
+            )
             print(f"[+] 完整 URL -> {out_path} ({len(urls)} 条)")
             print(f"[+] 业务 URL -> {biz_path} ({len(biz)} 条)")
             print(f"[+] 端点路径 -> {ep_path} ({len(endpoints)} 条)")
+            print(f"[+] 结构化指标 -> {jsonl_path} ({len(items)} 条)")
             print("\n=== 业务 URL ===")
             for u in sorted(biz):
                 print("  " + format_url_line(u, _source_index_of(u, idx)))

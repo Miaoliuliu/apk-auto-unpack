@@ -41,7 +41,7 @@ def test_extraction_status_empty_without_warning():
     assert status == "empty"
 
 
-def test_extraction_status_ok_ignores_warning():
+def test_extraction_status_partial_when_result_has_runtime_warning():
     task = SimpleNamespace(
         urls=[{"value": "https://api.myservice.com", "type": "url",
                "rank": "biz", "host": "api.myservice.com",
@@ -51,7 +51,22 @@ def test_extraction_status_ok_ignores_warning():
         warnings=["runtime_h5: uni-app 运行时拼 URL"],
     )
     _, _, status = rp._project_urls(task)
-    assert status == "ok"
+    assert status == "partial"
+
+
+def test_project_url_separates_business_likelihood_from_validation():
+    item = {
+        "value": "https://api.myservice.com",
+        "type": "url",
+        "rank": "biz",
+        "business_likelihood": 0.9,
+        "validation": {"syntax": "valid", "dns": "unresolved", "http": "not_checked"},
+        "sources": [],
+    }
+    projected = rp.project_url(item)
+    assert "confidence" not in projected
+    assert projected["business_likelihood"] == 0.9
+    assert projected["validation"]["dns"] == "unresolved"
 
 
 # ---------------------------------------------------------------------------

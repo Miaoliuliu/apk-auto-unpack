@@ -134,7 +134,7 @@ APK 分析通常要手工串联多个工具和步骤：壳识别、反编译、�
 **验收标准**
 - [ ] 生成 JSON 报告
 - [ ] 报告包含 `sample`、`packer_detection`、`unpack`、`extraction`、`urls`、`errors`
-- [ ] 每条 URL 包含 `value`、`type`、`source_file`、`source_kind`、`confidence`
+- [ ] 每条 URL 包含 `value`、`type`、`source_file`、`source_kind`、`business_likelihood`、`validation`
 - [ ] CLI 退出码区分成功、无 URL、识别失败、脱壳失败、输入非法
 - [ ] 支持指定输出目录
 
@@ -250,7 +250,7 @@ APK 分析通常要手工串联多个工具和步骤：壳识别、反编译、�
 |---|---|---|---|
 | 自动脱壳成功率低 | 高 | 高 | 插件化设计；MVP 不承诺全壳支持；按壳分别维护测试集 |
 | 壳识别误判 | 中 | 高 | 引入置信度和命中特征；低置信度进入 unknown |
-| URL 误报/漏报 | 高 | 中 | 保留来源位置和置信度；建立带标注的样本集 |
+| URL 误报/漏报 | 高 | 中 | 保留来源位置，分离业务相关性与语法/DNS/HTTP 验证状态；建立带标注的样本集 |
 | 外部工具环境复杂 | 中 | 中 | 启动时做依赖检查；报告记录工具版本 |
 | 动态脱壳不可信输入风险 | 中 | 高 | 默认关闭动态执行；要求隔离环境 |
 | Windows 路径兼容性问题 | 中 | 中 | 统一使用 `pathlib`，覆盖空格/中文路径测试 |
@@ -301,4 +301,3 @@ APK 分析通常要手工串联多个工具和步骤：壳识别、反编译、�
 - MobSF
 - androguard
 - Frida
-

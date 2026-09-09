@@ -12,10 +12,19 @@ import binascii
 import ipaddress
 import re
 import unicodedata
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
-# rank -> 置信度（report.py 的 PRD 合同同用这一份）
-RANK_CONF = {"biz": 0.9, "weak": 0.55, "noise": 0.25}
+# rank -> 业务相关性；这不是 URL 语法或可达性置信度。
+RANK_SCORE = {"biz": 0.9, "weak": 0.55, "noise": 0.25}
+# 保留导出名称供旧调用方过渡；新报告使用 business_likelihood。
+RANK_CONF = RANK_SCORE
+
+_SUPPORTED_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+_SCHEME_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+_BAD_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_BAD_URL_CHARS = frozenset('{}\\^|`<>"\'')
+MAX_URL_CHARS = 2048
 
 
 def _parse_ip(host: str):
@@ -62,64 +71,187 @@ def _netloc(scheme: str, host: str, port: int | None) -> str:
     return host
 
 
+def _valid_dns_host(host: str) -> tuple[bool, str]:
+    """校验 HTTP/WS 主机名并返回 IDNA 形式。"""
+    if not host or len(host) > 253:
+        return False, ""
+    trailing_dot = host.endswith(".")
+    body = host[:-1] if trailing_dot else host
+    try:
+        ascii_host = body.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return False, ""
+    labels = ascii_host.split(".")
+    if not labels or any(not _DNS_LABEL_RE.fullmatch(label) for label in labels):
+        return False, ""
+    normalized = ascii_host + ("." if trailing_dot else "")
+    return True, normalized
+
+
+def _split_candidate(raw: str):
+    """解析绝对 URL 或无协议 host[/path]，不为后者伪造协议。"""
+    if len(raw) > MAX_URL_CHARS:
+        return None
+    has_scheme = bool(_SCHEME_PREFIX_RE.match(raw))
+    target = raw if has_scheme else "//" + raw
+    try:
+        parts = urlsplit(target)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower() if has_scheme else ""
+    if has_scheme and scheme not in _SUPPORTED_SCHEMES:
+        return None
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    ip = _parse_ip(host)
+    if ip is not None:
+        normalized_host = str(ip)
+    else:
+        valid, normalized_host = _valid_dns_host(host)
+        if not valid:
+            return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
+    for component in (parts.path, parts.query, parts.fragment):
+        if _BAD_PERCENT_RE.search(component):
+            return None
+        if any(ch.isspace() or ord(ch) < 0x20 or ch in _BAD_URL_CHARS for ch in component):
+            return None
+    return parts, scheme, normalized_host, port
+
+
+# so / dex 调试符号、源码路径：无协议时不能当 host。
+_FILE_EXT_LABELS = frozenset({
+    "c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "hh",
+    "rs", "java", "kt", "kts", "go", "py", "proto", "class",
+    "so", "a", "o", "png", "jpg", "jpeg", "gif", "webp", "bmp",
+    "xml", "html", "htm", "css", "map", "smali", "dex", "jar",
+    "aar", "m", "mm", "swift", "gradle", "properties", "json",
+    "js", "ts", "tsx", "vue", "scss", "sass", "md", "txt",
+    "dat", "bin", "pak", "wasm",
+})
+_JUNK_PATH_MARKERS = (
+    "/home/runner/",
+    ".cargo/registry",
+    "index.crates.io",
+    "termux-android-tools",
+    "boringssl/src",
+    "resources.arsc",
+)
+_SOURCE_FILE_LINE_RE = re.compile(
+    r"(?i)(?:^|/)[A-Za-z0-9_.+\-]+\.(?:cc|c|cpp|h|hpp|rs|java|kt|go|m)(?::\d+)?$"
+)
+_ICON_STYLE_RE = re.compile(
+    r"^(?:Filled|Outlined|Rounded|TwoTone|Sharp|Material)\.",
+)
+_PASCAL_TOKEN_RE = re.compile(r"^[A-Z][a-z]+[A-Za-z0-9]*$")
+
+
+def _is_junk_network_token(raw: str) -> bool:
+    """无协议源码文件名、cargo 路径、图标常量等，不是通联地址。"""
+    s = (raw or "").strip().strip("\x00")
+    if not s or _SCHEME_PREFIX_RE.match(s):
+        return False
+    low = s.lower()
+    if any(p in low for p in _JUNK_PATH_MARKERS):
+        return True
+    head = s.split("?", 1)[0].split("#", 1)[0]
+    if _SOURCE_FILE_LINE_RE.search(head):
+        return True
+    if _ICON_STYLE_RE.match(s):
+        return True
+    hostport = head.split("/", 1)[0]
+    host = hostport.rsplit(":", 1)[0] if hostport.count(":") == 1 else hostport
+    if host.startswith("[") and "]" in host:
+        return False
+    first = host.split(".", 1)[0]
+    if _PASCAL_TOKEN_RE.match(first) and "." in host:
+        return True
+    labels = host.split(".")
+    if len(labels) >= 2 and labels[-1].lower() in _FILE_EXT_LABELS:
+        if len(labels) == 2:
+            return True
+        if _PASCAL_TOKEN_RE.match(first):
+            return True
+    return False
+
+
+def is_syntax_valid_candidate(raw: str) -> bool:
+    """是否为合法 HTTP/WS URL 或无协议网络主机指标。"""
+    value = (raw or "").strip().strip("\x00")
+    if len(value) < 4 or _is_junk_network_token(value):
+        return False
+    return _split_candidate(value) is not None
+
+
+def _canonical_candidate(raw: str, parsed) -> tuple[str, str, str, int | None, str]:
+    parts, scheme, host, port = parsed
+    userinfo = ""
+    if "@" in parts.netloc:
+        userinfo = parts.netloc.rsplit("@", 1)[0] + "@"
+    netloc = userinfo + _netloc(scheme, host, port)
+    path = quote(parts.path, safe="/%:@!$&'()*+,;=-._~%")
+    query = quote(parts.query, safe="/?@!$&'()*+,;=:-._~%[]")
+    fragment = quote(parts.fragment, safe="/?@!$&'()*+,;=:-._~%[]")
+    if scheme:
+        canonical = urlunsplit((scheme, netloc, path, query, fragment))
+    else:
+        canonical = netloc + path
+        if query:
+            canonical += "?" + query
+        if fragment:
+            canonical += "#" + fragment
+    return canonical, scheme, host, port, parts.path or ""
+
+
 def make_indicator(url: str, source_type: str, source_file: str,
                    method: str = "regex") -> dict | None:
     raw = (url or "").strip().strip("\x00")
     if not raw or len(raw) < 4:
         return None
-    candidate = raw
-    if "://" not in candidate:
-        candidate = "http://" + candidate
-    try:
-        parts = urlsplit(candidate)
-    except ValueError:
+    if _is_junk_network_token(raw):
         return None
-    scheme = (parts.scheme or "http").lower()
-    if scheme not in ("http", "https", "ws", "wss"):
+    parsed = _split_candidate(raw)
+    if parsed is None:
         return None
-    host = (parts.hostname or "").lower()
-    if not host:
-        return None
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-    path = parts.path or ""
-    netloc = _netloc(scheme, host, port)
-    canonical = urlunsplit((scheme, netloc, path, parts.query, ""))
-    ranked = raw if "://" in raw else canonical
+    canonical, scheme, host, port, path = _canonical_candidate(raw, parsed)
     kind = classify_type(raw, host, path)
-    rank = url_rank(ranked)
+    rank = url_rank(raw)
+    # so 里无 scheme、又不是 host:非常用端口 的点分串，默认不是业务后端。
+    if source_type == "native" and not scheme:
+        if not (port and port not in (80, 443, 53, 853)):
+            if rank == "biz":
+                rank = "weak"
     return {
-        "value": ranked,
+        "value": raw,
+        "observed_value": raw,
         "type": kind,
-        "url": ranked,
+        "url": raw,
         "canonical": canonical,
-        "scheme": scheme,
+        "scheme": scheme or None,
         "host": host,
         "port": port,
         "path": path,
         "rank": rank,
-        "confidence": RANK_CONF.get(rank, 0.4),
+        "business_likelihood": RANK_SCORE.get(rank, 0.4),
+        "validation": {
+            "syntax": "valid",
+            "dns": "not_checked",
+            "http": "not_checked",
+        },
         "source_kind": source_type,
         "sources": [{"type": source_type, "file": source_file, "method": method}],
     }
 
 
 def _merge_key(raw: str) -> str:
-    """计算合并去重键：http/https 折叠 + 默认端口剥离。"""
-    try:
-        parts = urlsplit(raw if "://" in raw else "http://" + raw)
-    except ValueError:
-        return raw
-    scheme = (parts.scheme or "http").lower()
-    host = (parts.hostname or "").lower()
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-    fold_scheme = "http" if scheme in ("http", "https") else scheme
-    return urlunsplit((fold_scheme, _netloc(scheme, host, port), parts.path, parts.query, ""))
+    """仅合并同一规范化值；HTTP 与 HTTPS 必须保持独立。"""
+    return raw
 
 
 def merge_indicators(items: list[dict]) -> list[dict]:
@@ -142,17 +274,9 @@ def merge_indicators(items: list[dict]) -> list[dict]:
             if sig not in seen:
                 by[key]["sources"].append(dict(s))
                 seen.add(sig)
-        # https 优先；保留更像完整 URL 的展示串
-        old = by[key].get("url") or ""
-        new = it.get("url") or ""
-        if new.lower().startswith("https://") and not old.lower().startswith("https://"):
-            for field in ("url", "value", "canonical", "scheme"):
-                if field in it:
-                    by[key][field] = it[field]
-        elif "://" in new and "://" not in old:
-            by[key]["url"] = new
-            if it.get("value"):
-                by[key]["value"] = it["value"]
+        if RANK_SCORE.get(it.get("rank"), 0) > RANK_SCORE.get(by[key].get("rank"), 0):
+            by[key]["rank"] = it.get("rank")
+            by[key]["business_likelihood"] = it.get("business_likelihood")
     return sorted(by.values(), key=lambda x: (x.get("rank") != "biz", x.get("url") or ""))
 
 
@@ -265,25 +389,31 @@ def render_url_line(url: str, sources: list[dict] | None,
 # URL 提取
 # ---------------------------------------------------------------------------
 # 完整 http/https/ws/wss URL（大小写不敏感；不含控制字符，避免二进制粘连）
-_URL_SAFE = r"[^\s\"'<>\\`\x00-\x1f\x7f]"
-URL_RE = re.compile(rf"(?:https?|wss?)://{_URL_SAFE}+", re.IGNORECASE)
+_URL_SAFE = r"[^\s\"'<>\\`{}^|\x00-\x1f\x7f]"
+URL_RE = re.compile(
+    r"(?:https?|wss?)://[^\s\"'<>\\`\x00-\x1f\x7f]+",
+    re.IGNORECASE,
+)
 _URL_BYTE_RE = re.compile(
-    rb"(?:https?|wss?)://[^\x00-\x1f\x7f-\xff\s\"'<>\\`]{4,240}",
+    rb"(?:https?|wss?)://[^\x00-\x1f\x7f-\xff\s\"'<>\\`]{4,2040}"
+    rb"(?![^\x00-\x1f\x7f-\xff\s\"'<>\\`])",
     re.IGNORECASE,
 )
 # resources.arsc / so 里常见 UTF-16LE：h\0t\0t\0p\0s\0:\0/\0/\0...
 _URL_UTF16_RE = re.compile(
     rb"(?:h\x00t\x00t\x00p\x00s?\x00|w\x00s\x00s?\x00)"
     rb":\x00/\x00/\x00"
-    rb"(?:[\x20-\x7e]\x00){4,240}",
+    rb"(?:[\x20-\x7e]\x00){4,2040}(?![\x20-\x7e]\x00)"
+    rb"(?![{}^|]\x00)",
     re.IGNORECASE,
 )
 # 裸 IPv4:port 或 IPv4/path（配置/资源表常不带 scheme）
 _IP_PORT_BYTE_RE = re.compile(
     rb"(?<![0-9.])"
     rb"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)"
-    rb"(?::\d{2,5}(?:/[^\x00-\x1f\x7f-\xff\s\"'<>\\`]{0,80})?"
-    rb"|/[^\x00-\x1f\x7f-\xff\s\"'<>\\`]{1,80})"
+    rb"(?::\d{1,5}(?:/[^\x00-\x1f\x7f-\xff\s\"'<>\\`{}^|]{0,2020})?"
+    rb"|/[^\x00-\x1f\x7f-\xff\s\"'<>\\`{}^|]{1,2020})"
+    rb"(?![^\x00-\x1f\x7f-\xff\s\"'<>\\`{}^|])"
 )
 # 裸 IPv4，要求带端口或路径（避免匹配普通数字串）: 192.168.1.1:8080/api
 IP_HOST_RE = re.compile(
@@ -298,44 +428,39 @@ _IPV6_BARE_RE = re.compile(
 )
 _IPV6_HOSTPORT_RE = re.compile(
     r'^\[([0-9a-fA-F:.]{2,45})\](?::(\d{1,5}))?$',
-    re.I,
+    re.IGNORECASE,
 )
 _IPV6_PORT_BYTE_RE = re.compile(
     rb'(?<!:)\['
     rb'[0-9a-fA-F:.]{2,45}'
     rb'\]'
-    rb'(?::\d{2,5}(?:/[^\x00-\x1f\x7f-\xff\s\"\'<>\\`]{0,80})?'
-    rb'|/[^\x00-\x1f\x7f-\xff\s\"\'<>\\`]{1,80})'
+    rb'(?::\d{1,5}(?:/[^\x00-\x1f\x7f-\xff\s\"\'<>\\`{}^|]{0,1980})?'
+    rb'|/[^\x00-\x1f\x7f-\xff\s\"\'<>\\`{}^|]{1,1980})'
+    rb'(?![^\x00-\x1f\x7f-\xff\s\"\'<>\\`{}^|])'
 )
 # www. 开头的域名（强信号，几乎不会误报）
 WWW_RE = re.compile(rf'(?<![\w.])www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{{2,}}(?:{_URL_SAFE}*)?')
-# 无 scheme 的域名，要求已知 TLD 且带端口或路径，降低与包名/类名的误报
-_TLDS = (
-    r'(?:com|net|org|cn|io|co|app|xyz|dev|ai|me|info|biz|top|vip|shop|tech|'
-    r'online|site|cloud|fun|icu|club|live|store|cc|tv|us|ru|jp|kr|hk|tw|im|'
-    r'wang|xin|work|cfd|bond|click|cyou|rest|today|sbs)'
-)
+# 无 scheme 的域名，要求合法 TLD 形态且带端口或路径，降低与包名/类名的误报
+# 裸域名只约束 TLD 语法，不维护必然过时的后缀白名单。DNS/PSL 状态由验证层给出。
+_TLDS = r'(?:xn--[a-z0-9-]{2,59}|[a-z]{2,63})'
 DOMAIN_RE = re.compile(
     rf'(?<![\w.])[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?'
-    rf'(?:\.[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?)+'
+    rf'(?:\.[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?)*'
     rf'\.{_TLDS}(?::\d{{1,5}}(?:/{_URL_SAFE}*)?|/{_URL_SAFE}*)',
     re.IGNORECASE,
 )
 # 无 scheme、无端口/路径的裸域名（uni-app JS 常写 "api.xxx.cn"）
 _BARE_HOST_RE = re.compile(
     r'(?<![\w.])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
-    r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\.'
+    r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.'
     + _TLDS
     + r'(?![\w.:/])',
-    re.I,
+    re.IGNORECASE,
 )
 # Java 包名前缀，避免把 com.example.app 当 host
 _PKG_FIRST_LABELS = frozenset({
     "com", "org", "net", "io", "android", "java", "javax", "kotlin", "cn",
 })
-
-# 去掉 URL 尾部的标点/引号/NUL。`]` 单独处理：IPv6 闭合括号不能剥。
-CLEAN_RE = re.compile(r'[\x00),.;:!]+$')
 
 # ---------------------------------------------------------------------------
 # 业务 URL 过滤（丢掉框架/SDK 噪音，留下样本自己的后端）
@@ -376,7 +501,7 @@ _NOISE_SUBSTR = (
     "119.29.29.98",
     "configgetsvc", "rainbowapi.configs",
 )
-_NOISE_PREFIX = ("android.", "kotlin.", "java.", "javax.")
+_NOISE_PREFIX = ("android.", "androidx.", "kotlin.", "java.", "javax.")
 _NOISE_HOST_ROOTS = (
     "baidu.com", "baifubao.com", "bdstatic.com", "amap.com",
     "vuejs.org", "alipay.com", "live.com", "yahoo.com",
@@ -404,6 +529,12 @@ _NOISE_HOST_ROOTS = (
     "videolan.org", "dashif.org", "mql5.com", "mql4.com",
     "bigo.live", "smart-glocal.com",
     "tencent-cloud.com", "alibaba.com",
+    "libcore.icu.icu", "mi1.cc",
+    # 2026-09-08 重跑：IM/直播/广告 SDK 带 /v2/ 或灰产 TLD，被抬成 biz
+    "zego.im", "kugou.com", "netease.im",
+    "pangolin-sdk-toutiao.com", "pangolin-sdk-toutiao-b.com",
+    "mozilla.org", "bytedance.com",
+    "telegram.org", "nextcloud.com",
 )
 # 公共 DNS / 模拟器：端口常不是 80/443，旧规则会误抬成 biz
 _PUBLIC_DNS_IPS = frozenset({
@@ -471,43 +602,57 @@ def _looks_plausible_url(u: str) -> bool:
         return False
     if labels[-1] == "info" and labels[-2].lower() in _LOG_INFO_LABELS:
         return False
-    if labels[-2].lower() in ("error", "logger", "debug", "verbose") and labels[-1] in (
-        "cn", "com", "net", "org", "info",
-    ):
-        return False
-    return True
+    return not (
+        labels[-2].lower() in ("error", "logger", "debug", "verbose")
+        and labels[-1] in ("cn", "com", "net", "org", "info")
+    )
 
 
 # ---------------------------------------------------------------------------
 # 业务提取规则（新样本漏报：把键名 / TLD / 路径形态加到这张表，再补一条测试）
 # ---------------------------------------------------------------------------
-# 灰产常用 TLD：即使没有路径，引号里的裸域名也当业务 host
-_GRAY_TLD = (
-    r'(?:shop|top|xyz|vip|cc|im|icu|fun|club|online|site|live|store|'
-    r'wang|xin|work|cfd|bond|click|cyou|rest|today|cloud|tech|sbs)'
-)
+# 灰产常用 TLD：带 scheme 时抬成 biz；无协议裸域名不再单靠 TLD 进 biz。
+# 例外：无协议但首标签是 api/apis 的灰产 host（助手小智 api.*.shop）。
+_GRAY_TLD_LABELS = frozenset({
+    "shop", "top", "xyz", "vip", "cc", "im", "icu", "fun", "club",
+    "online", "site", "live", "store", "wang", "xin", "work", "cfd",
+    "bond", "click", "cyou", "rest", "today", "cloud", "tech", "sbs",
+})
+_GRAY_TLD = r'(?:' + "|".join(sorted(_GRAY_TLD_LABELS, key=len, reverse=True)) + ")"
+# 非常用端口抬 biz：最后一节必须是可识别 TLD（ccTLD 两字母另判），挡住 i.length:16
+_PORT_BIZ_TLDS = _GRAY_TLD_LABELS | frozenset({
+    "com", "net", "org", "edu", "gov", "mil", "int", "biz", "info",
+    "pro", "name", "mobi", "asia", "aero", "coop", "app", "dev",
+    "zip", "chat", "blog", "news", "page", "wiki", "host", "space",
+    "website", "email", "link", "group", "ltd", "llc", "games",
+})
+_CAMEL_LABEL_RE = re.compile(r"[a-z][A-Z]")
 _HOST_LIST_RE = re.compile(
     r"(?:domainList|hostList|urlList|apiList|serverList|domain_list|host_list)"
     r"\s*[:=]\s*\[([^\]]*)\]",
-    re.I,
+    re.IGNORECASE,
+)
+_CONFIG_KEY_PATTERN = (
+    r"baseUrl|base_url|apiUrl|api_url|apiHost|api_host|serverUrl|serverHost|"
+    r"commonUrl|requestUrl|h5Url|hostUrl|ossUrl|uploadUrl|cdnUrl|wsUrl|wssUrl|"
+    r"imUrl|BASE_URL|API_URL|API_HOST|BASE_HOST|SERVER_URL|APP_URL|H5_URL"
 )
 _CONFIG_ASSIGN_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:baseUrl|baseURL|base_url|apiUrl|apiURL|api_url|"
-    r"apiHost|api_host|serverUrl|serverURL|serverHost|commonUrl|requestUrl|"
-    r"h5Url|H5Url|hostUrl|ossUrl|uploadUrl|cdnUrl|wsUrl|wssUrl|imUrl|"
-    r"BASE_URL|API_URL|API_HOST|BASE_HOST|SERVER_URL|APP_URL|H5_URL)"
-    r"\s*[:=]\s*(?:['\"]([^'\"]+)['\"]|((?:https?|wss?)://[^\s'\"#,;]+))",
-    re.I,
+    rf"(?<![A-Za-z0-9_])(?P<key>{_CONFIG_KEY_PATTERN})"
+    r"\s*[:=]\s*(?:['\"](?P<quoted>[^'\"]+)['\"]|"
+    r"(?P<bare>(?:https?|wss?)://[^\s'\"#,;]+))",
+    re.IGNORECASE,
 )
 _JSON_URL_FIELD_RE = re.compile(
-    r"['\"](?:url|baseUrl|baseURL|apiUrl|apiHost|host|domain|server|"
-    r"endpoint|origin|cdn|oss|upload|wss|wsHost)['\"]\s*:\s*['\"]([^'\"]+)['\"]",
-    re.I,
+    r"['\"](?P<key>url|baseUrl|apiUrl|apiHost|host|domain|server|"
+    r"endpoint|origin|cdn|oss|upload|wss|wsHost)['\"]\s*:\s*"
+    r"['\"](?P<value>[^'\"]+)['\"]",
+    re.IGNORECASE,
 )
 _CONCAT_PATH_RE = re.compile(
-    r"(?:commonUrl|baseUrl|baseURL|apiUrl|apiURL|requestUrl|serverUrl)"
-    r"\s*\+\s*['\"](/[^'\"]+)['\"]",
-    re.I,
+    r"(?P<key>commonUrl|baseUrl|apiUrl|requestUrl|serverUrl)"
+    r"\s*\+\s*['\"](?P<path>/[^'\"]+)['\"]",
+    re.IGNORECASE,
 )
 _PHP_PATH_RE = re.compile(r"/(?:index|api|app|admin)\.php/[A-Za-z0-9_./-]+")
 _PHP_STATIC_RE = re.compile(r"/static/[A-Za-z0-9_./-]+\.php")
@@ -521,16 +666,16 @@ _QUOTED_GRAY_HOST_RE = re.compile(
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\."
     + _GRAY_TLD
     + r")['\"]",
-    re.I,
+    re.IGNORECASE,
 )
 _QUOTED_HOST_RE = re.compile(
     r"['\"]([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\."
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\."
     + _TLDS
     + r")['\"]",
-    re.I,
+    re.IGNORECASE,
 )
-_SCHEME_RE = re.compile(r"^(?:https?|wss?)://", re.I)
+_SCHEME_RE = re.compile(r"^(?:https?|wss?)://", re.IGNORECASE)
 
 _DEX_HARVEST_HINTS = (
     "http://", "https://", "ws://", "wss://",
@@ -540,34 +685,17 @@ _DEX_HARVEST_HINTS = (
 
 def _host_of(url: str) -> str:
     """取 host（小写）。IPv6 字面量取方括号内地址。"""
-    s = url.strip()
-    if "://" in s:
-        s = s.split("://", 1)[1]
-    s = s.split("/")[0].split("?")[0]
-    if s.startswith("["):  # IPv6: [2001:db8::1]:8080
-        end = s.find("]")
-        s = s[1:end] if end != -1 else s
-    else:
-        s = s.split(":")[0]
-    return s.lower()
+    parsed = _split_candidate((url or "").strip())
+    return parsed[2] if parsed is not None else ""
 
 
 def _url_port_and_path(url: str) -> tuple[int | None, str]:
     """从 URL 里拆端口和路径（不含 query）。"""
-    s = (url or "").strip()
-    if "://" in s:
-        s = s.split("://", 1)[1]
-    hostport, _, rest = s.partition("/")
-    path = "/" + rest.split("?")[0] if rest else ""
-    port = None
-    if ":" in hostport:
-        maybe = hostport.rsplit(":", 1)[-1]
-        if maybe.isdigit():
-            try:
-                port = int(maybe)
-            except ValueError:
-                port = None
-    return port, path
+    parsed = _split_candidate((url or "").strip())
+    if parsed is None:
+        return None, ""
+    parts, _scheme, _host, port = parsed
+    return port, parts.path or ""
 
 
 def _looks_code_host(host: str) -> bool:
@@ -588,15 +716,20 @@ def is_noise_url(u: str) -> bool:
     low = u.lower()
     if low.startswith(_NOISE_PREFIX) and "://" not in u:
         return True
-    # 噪音子串只匹配 scheme://host/path 部分（剔除 query/fragment），
-    # 避免 query 里嵌套的外部 URL（?u=https://github.com/...）整条被误杀
-    no_q = low.split("?", 1)[0].split("#", 1)[0]
-    if any(n in no_q for n in _NOISE_SUBSTR):
-        return True
     host = _host_of(u)
     if not host:
         return True
-    port, _path = _url_port_and_path(u)
+    # 域名规则按 host 边界匹配；带路径/普通关键词的规则才做子串匹配。
+    # 避免 query 里嵌套的外部 URL（?u=https://github.com/...）整条被误杀
+    no_q = low.split("?", 1)[0].split("#", 1)[0]
+    if any(
+        (n in no_q if "/" in n or "." not in n else host == n or host.endswith("." + n))
+        for n in _NOISE_SUBSTR
+    ):
+        return True
+    port, path = _url_port_and_path(u)
+    if (path or "").split("?")[0].rstrip("/").endswith("/netcheck"):
+        return True
     ip = _parse_ip(host)
     if ip is not None:
         if ip.is_loopback or ip.is_unspecified or ip.is_link_local:
@@ -613,9 +746,7 @@ def is_noise_url(u: str) -> bool:
                 str(mapped) in _PUBLIC_DNS_IPS or str(mapped) in _EMULATOR_IPS
             ):
                 return True
-        if port in _DNS_PORTS:
-            return True
-        return False
+        return port in _DNS_PORTS
     if "." not in host:
         return True
     if _looks_code_host(host):
@@ -627,9 +758,7 @@ def is_noise_url(u: str) -> bool:
                               "/trax/features", "/ns/structure")):
         return True
     check = u if "://" in u else "http://" + u
-    if not _looks_plausible_url(check):
-        return True
-    return False
+    return not _looks_plausible_url(check)
 
 
 _BIZ_PATH_HINTS = (
@@ -637,22 +766,40 @@ _BIZ_PATH_HINTS = (
     "/user/", "/login", "/upload", "/ios", "/android", "/bot/",
     "/release", "/gateway", "/im/", "/socket",
 )
-_GRAY_TLD_HOST_RE = re.compile(r"\." + _GRAY_TLD + r"$", re.I)
+_GRAY_TLD_HOST_RE = re.compile(r"\." + _GRAY_TLD + r"$", re.IGNORECASE)
+
+
+def _host_ok_for_unusual_port(host: str) -> bool:
+    """非常用端口抬 biz 时，host 必须是 IP 或带可识别 TLD 的域名。
+
+    挡住 JS/二进制碎片：i.length:16、xmp.did:50、t.audioBitrate:1。
+    """
+    if _parse_ip(host or "") is not None:
+        return True
+    labels = (host or "").split(".")
+    if len(labels) < 2:
+        return False
+    tld = labels[-1].lower()
+    if not ((len(tld) == 2 and tld.isalpha()) or tld in _PORT_BIZ_TLDS):
+        return False
+    return not any(_CAMEL_LABEL_RE.search(lab) for lab in labels)
 
 
 def url_rank(u: str) -> str:
     """noise = 框架/文档；weak = 像 URL 但无业务信号；biz = 灰产后端。"""
     u = (u or "").strip().strip("\x00")
-    if not u or is_noise_url(u):
+    if not u or _is_junk_network_token(u) or is_noise_url(u):
         return "noise"
     host = _host_of(u)
     low = u.lower()
     port, path = _url_port_and_path(u)
     path_only = (path or "").split("?")[0]
+    has_scheme = bool(_SCHEME_PREFIX_RE.match(u))
     has_biz_path = (
         any(h in low for h in _BIZ_PATH_HINTS)
         or ".php" in path_only.lower()
     )
+    first = (host or "").split(".")[0]
     if _parse_ip(host or "") is not None:
         # 裸 IP:80/443 无路径多半是 CDN/证书探测；真正 C2 常带路径或非常用端口
         if has_biz_path or path_only not in ("", "/"):
@@ -660,86 +807,46 @@ def url_rank(u: str) -> str:
         if port and port not in (80, 443):
             return "biz"
         return "weak"
-    if host and _GRAY_TLD_HOST_RE.search(host):
+    if (
+        port and port not in (80, 443) and port not in _DNS_PORTS
+        and _host_ok_for_unusual_port(host)
+    ):
         return "biz"
+    if host and _GRAY_TLD_HOST_RE.search(host):
+        if has_scheme or first in ("api", "apis"):
+            return "biz"
     if has_biz_path:
         return "biz"
-    first = (host or "").split(".")[0]
-    if first in ("api", "apis", "gateway", "gw"):
+    if has_scheme and first in ("api", "apis", "gateway", "gw"):
         return "biz"
     if low.startswith(("ws://", "wss://")):
         return "biz"
     return "weak"
 
 
-def _url_core(u: str) -> tuple[str, str, str, str]:
-    """(scheme, hostport, path, query) 便于折叠 http/https 与 tracking query。"""
-    s = (u or "").strip()
-    scheme = ""
-    if "://" in s:
-        scheme, s = s.split("://", 1)
-        scheme = scheme.lower()
-    hostport, _, rest = s.partition("/")
-    if rest:
-        path, _, query = rest.partition("?")
-        path = "/" + path
-    else:
-        path, query = "", ""
-    return scheme, hostport.lower(), path, query
-
-
-def _query_is_tracking(query: str) -> bool:
-    q = (query or "").lower().replace("&amp;", "&")
-    if not q:
-        return False
-    return "utm_" in q or "mail.welcome" in q or "campaign=" in q
-
-
 def fold_related_urls(urls: set[str]) -> set[str]:
-    """同一资源只留一条：https 优于 http；utm/locale query 变体只留一条。"""
-    by_full: dict[tuple[str, str, str], str] = {}
-    for u in urls:
-        if not u:
-            continue
-        scheme, hostport, path, query = _url_core(u)
-        key = (hostport, path, query)
-        prev = by_full.get(key)
-        if prev is None:
-            by_full[key] = u
-            continue
-        if scheme == "https" and not prev.lower().startswith("https://"):
-            by_full[key] = u
-    groups: dict[tuple[str, str], list[str]] = {}
-    for u in by_full.values():
-        _scheme, hostport, path, _query = _url_core(u)
-        groups.setdefault((hostport, path), []).append(u)
-    out: set[str] = set()
-    for variants in groups.values():
-        tracking = [v for v in variants if _query_is_tracking(_url_core(v)[3])]
-        plain = [v for v in variants if not _query_is_tracking(_url_core(v)[3])]
-        if len(tracking) >= 2 and not plain:
-            https = [v for v in tracking if v.lower().startswith("https://")]
-            out.add(sorted(https or tracking, key=len)[0])
-            continue
-        out.update(plain or tracking)
-    return out
+    """只做空值清理；不同协议、query 和 fragment 都是独立观测证据。"""
+    return {u for u in urls if u}
 
 
-def weak_worth_listing(u: str) -> bool:
-    """写进 urls_by_rank.txt 的 weak：要有路径、非常用端口、IP，避免裸域名刷屏。"""
-    if url_rank(u) != "weak":
-        return False
+def _weak_has_signal(u: str) -> bool:
+    """weak 是否值得写入清单：有路径、非常用端口、IP，或 api/gw 前缀。"""
     host = _host_of(u)
     port, path = _url_port_and_path(u)
     path_only = (path or "").split("?")[0]
     if _parse_ip(host or "") is not None:
         return True
-    if port and port not in (80, 443):
+    if port and port not in (80, 443) and _host_ok_for_unusual_port(host):
         return True
     if path_only not in ("", "/"):
         return True
     first = (host or "").split(".")[0]
     return first in ("api", "apis", "gateway", "gw", "im", "oss")
+
+
+def weak_worth_listing(u: str) -> bool:
+    """写进 urls_by_rank.txt 的 weak：要有路径、非常用端口、IP，避免裸域名刷屏。"""
+    return url_rank(u) == "weak" and _weak_has_signal(u)
 
 
 def business_urls(urls: set[str]) -> set[str]:
@@ -767,28 +874,20 @@ FS_PREFIXES = ("/proc/", "/sys/", "/dev/", "/system/", "/data/", "/sdcard/", "/s
 
 
 def _clean_url(s: str) -> str:
-    s = "".join(ch for ch in (s or "") if ch.isprintable() and ch not in "\x7f")
-    s = CLEAN_RE.sub("", s)
-    # 尾部 ] 多半是 [url] 包裹；IPv6 hostport 的闭合括号要留
-    while s.endswith("]"):
-        rest = s.split("://", 1)[-1]
-        hp = rest.split("/", 1)[0].split("?", 1)[0]
-        if _IPV6_HOSTPORT_RE.match(hp) and (
-            s.endswith(hp) or rest.startswith(hp + "/") or rest.startswith(hp + "?")
-        ):
-            break
+    s = (s or "").strip().strip("\x00")
+    # 只剥离明显不配对的宿主文本闭合符；不得删除 URL 合法的 / ; ! . 等尾字符。
+    while s.endswith(")") and s.count(")") > s.count("("):
         s = s[:-1]
-    return s.rstrip("/\\")
+    while s.endswith("]") and s.count("]") > s.count("["):
+        s = s[:-1]
+    return s
 
 
 def _utf16le_to_ascii(blob: bytes) -> str:
     """把 UTF-16LE 交错字节收成 ASCII 串（失败则空）。"""
     if len(blob) < 2:
         return ""
-    try:
-        text = blob.decode("utf-16le", errors="ignore")
-    except Exception:
-        return ""
+    text = blob.decode("utf-16le", errors="ignore")
     return "".join(ch for ch in text if ch.isprintable() or ch in "/:?&=#%+.-_")
 
 
@@ -797,33 +896,35 @@ def _scan_raw_for_urls(raw: bytes) -> set[str]:
     found: set[str] = set()
     if not raw:
         return found
-    for m in _URL_BYTE_RE.finditer(raw):
+    full_matches = list(_URL_BYTE_RE.finditer(raw))
+    full_spans = [match.span() for match in full_matches]
+    for m in full_matches:
         u = _clean_url(m.group().decode("ascii", errors="ignore"))
-        if u and _looks_plausible_url(u):
+        if is_syntax_valid_candidate(u):
             found.add(u)
     for m in _URL_UTF16_RE.finditer(raw):
         u = _clean_url(_utf16le_to_ascii(m.group()))
-        if u and "://" in u and _looks_plausible_url(u):
+        if "://" in u and is_syntax_valid_candidate(u):
             found.add(u)
     for m in _IP_PORT_BYTE_RE.finditer(raw):
+        if any(start < m.end() and m.start() < end for start, end in full_spans):
+            continue
         hostpath = m.group().decode("ascii", errors="ignore")
         if not hostpath:
             continue
-        for scheme in ("https://", "http://"):
-            u = _clean_url(scheme + hostpath)
-            if u and not is_noise_url(u) and _looks_plausible_url(u):
-                found.add(u)
-                break
+        u = _clean_url(hostpath)
+        if is_syntax_valid_candidate(u) and not is_noise_url(u):
+            found.add(u)
     for m in _IPV6_PORT_BYTE_RE.finditer(raw):
+        if any(start < m.end() and m.start() < end for start, end in full_spans):
+            continue
         blob = m.group().decode("ascii", errors="ignore")
         inner = blob[1:blob.find("]")] if blob.startswith("[") and "]" in blob else ""
         if _parse_ip(inner) is None:
             continue
-        for scheme in ("https://", "http://"):
-            u = _clean_url(scheme + blob)
-            if u and not is_noise_url(u) and _looks_plausible_url(u):
-                found.add(u)
-                break
+        u = _clean_url(blob)
+        if is_syntax_valid_candidate(u) and not is_noise_url(u):
+            found.add(u)
     return found
 
 
@@ -856,14 +957,14 @@ def _iter_urls(s: str):
     full = list(URL_RE.finditer(s))
     for m in full:
         u = _clean_url(m.group(0))
-        if u and not u.endswith("://"):
+        if not u.endswith("://") and is_syntax_valid_candidate(u):
             yield u
     s = _mask(s, full)
 
     ip = list(IP_HOST_RE.finditer(s))
     for m in ip:
         u = _clean_url(m.group(0))
-        if u:
+        if is_syntax_valid_candidate(u):
             yield u
     s = _mask(s, ip)
 
@@ -872,28 +973,29 @@ def _iter_urls(s: str):
         if _parse_ip(m.group(1)) is None:
             continue
         u = _clean_url(m.group(0))
-        if u:
+        if is_syntax_valid_candidate(u):
             yield u
     s = _mask(s, ipv6)
 
     www = list(WWW_RE.finditer(s))
     for m in www:
         u = _clean_url(m.group(0))
-        if u:
+        if is_syntax_valid_candidate(u):
             yield u
     s = _mask(s, www)
 
     dom = list(DOMAIN_RE.finditer(s))
     for m in dom:
         u = _clean_url(m.group(0))
-        if u:
+        if is_syntax_valid_candidate(u):
             yield u
     s = _mask(s, dom)
 
     for m in _BARE_HOST_RE.finditer(s):
         u = _clean_url(m.group(0))
         host = u.split("/")[0].split(":")[0]
-        if u and not _is_package_like_host(host):
+        if (not _is_package_like_host(host)
+                and is_syntax_valid_candidate(u)):
             yield u
 
 
@@ -906,18 +1008,14 @@ def _is_abs_endpoint(p: str) -> bool:
     low = p.lower()
     if low.endswith(ENDPOINT_EXT_BLACKLIST):
         return False
-    if low.startswith(FS_PREFIXES):
-        return False
-    return True
+    return not low.startswith(FS_PREFIXES)
 
 
 def _is_rel_endpoint(p: str) -> bool:
     segs = p.split("/")
     if any(seg in ("", ".", "..") for seg in segs):
         return False
-    if p.lower().endswith(ENDPOINT_EXT_BLACKLIST):
-        return False
-    return True
+    return not p.lower().endswith(ENDPOINT_EXT_BLACKLIST)
 
 
 def _collect_endpoint(s: str, out: set[str]) -> None:
@@ -938,11 +1036,6 @@ def _is_ws_base(base: str) -> bool:
     return base.lower().startswith(("ws://", "wss://"))
 
 
-def _is_origin_only(base: str) -> bool:
-    rest = base.split("://", 1)[-1]
-    return "/" not in rest
-
-
 def _looks_like_api_path(p: str) -> bool:
     pl = (p or "").split("?", 1)[0].lower()
     if len(pl) < 3 or not pl.startswith("/"):
@@ -953,9 +1046,7 @@ def _looks_like_api_path(p: str) -> bool:
         return True
     if pl.startswith(("/api/", "/v1/", "/v2/", "/app/", "/admin/")):
         return True
-    if "/home/" in pl:
-        return True
-    return False
+    return "/home/" in pl
 
 
 def _join_base_path(base: str, path: str) -> str:
@@ -966,41 +1057,33 @@ def _join_base_path(base: str, path: str) -> str:
 
 
 def _normalize_base(value: str) -> list[str]:
-    """配置值 -> 可拼接的 origin/前缀（已滤噪音）。"""
-    v = (value or "").strip().strip("\x00").strip().rstrip("/")
+    """配置值 -> 保真、语法合法的 origin/前缀；绝不猜测协议。"""
+    v = (value or "").strip().strip("\x00").strip()
     if not v or len(v) > 180 or " " in v or "\n" in v:
         return []
     if "${" in v or "%s" in v:
         return []
-    if _SCHEME_RE.match(v):
-        u = _clean_url(v)
-        if u and not is_noise_url(u):
-            return [u]
-        return []
-    host = _host_of(v)
-    if "." not in host and _parse_ip(host) is None:
-        return []
-    out = []
-    for scheme in ("http://", "https://"):
-        u = _clean_url(scheme + v)
-        if u and not is_noise_url(u):
-            out.append(u)
-    return out
+    u = _clean_url(v)
+    return [u] if is_syntax_valid_candidate(u) else []
 
 
-def _ingest_config_value(value: str, urls: set[str], endpoints: set[str],
-                         bases: set[str]) -> None:
+def _ingest_config_value(
+    value: str,
+    urls: set[str],
+    endpoints: set[str],
+) -> list[str]:
     v = (value or "").strip()
     if not v:
-        return
+        return []
     if v.startswith("/"):
         path = v.split("?", 1)[0]
         if _looks_like_api_path(path):
             endpoints.add(path)
-        return
-    for b in _normalize_base(v):
+        return []
+    normalized = _normalize_base(v)
+    for b in normalized:
         urls.add(b)
-        bases.add(b)
+    return normalized
 
 
 def _collect_api_paths(text: str, endpoints: set[str]) -> set[str]:
@@ -1011,43 +1094,43 @@ def _collect_api_paths(text: str, endpoints: set[str]) -> set[str]:
         paths.add(p)
     for p in _QUOTED_API_PATH_RE.findall(text):
         paths.add(p.split("?", 1)[0])
-    for p in _CONCAT_PATH_RE.findall(text):
-        paths.add(p.split("?", 1)[0])
+    for match in _CONCAT_PATH_RE.finditer(text):
+        paths.add(match.group("path").split("?", 1)[0])
     for p in paths:
         endpoints.add(p)
     return paths
 
 
 def _harvest_config(text: str, urls: set[str], endpoints: set[str]) -> None:
-    """配置键、域名列表、灰产 TLD 裸域名、拼接路径；同文件 host×接口还原。"""
-    bases: set[str] = set()
+    """收割配置值；只按同名变量的显式拼接关系还原 URL。"""
+    bases_by_name: dict[str, set[str]] = {}
     for m in _HOST_LIST_RE.finditer(text):
         for d in re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)):
-            _ingest_config_value(d, urls, endpoints, bases)
+            _ingest_config_value(d, urls, endpoints)
     for m in _CONFIG_ASSIGN_RE.finditer(text):
-        _ingest_config_value(m.group(1) or m.group(2), urls, endpoints, bases)
+        values = _ingest_config_value(
+            m.group("quoted") or m.group("bare"), urls, endpoints,
+        )
+        bases_by_name.setdefault(m.group("key").lower(), set()).update(values)
     for m in _JSON_URL_FIELD_RE.finditer(text):
-        _ingest_config_value(m.group(1), urls, endpoints, bases)
+        values = _ingest_config_value(m.group("value"), urls, endpoints)
+        bases_by_name.setdefault(m.group("key").lower(), set()).update(values)
     for h in _QUOTED_GRAY_HOST_RE.findall(text):
-        _ingest_config_value(h, urls, endpoints, bases)
+        _ingest_config_value(h, urls, endpoints)
     for h in _QUOTED_HOST_RE.findall(text):
         if _is_package_like_host(h):
             continue
-        _ingest_config_value(h, urls, endpoints, bases)
+        _ingest_config_value(h, urls, endpoints)
 
-    api_paths = _collect_api_paths(text, endpoints)
-    for p in _CONCAT_PATH_RE.findall(text):
-        path = p.split("?", 1)[0]
-        for b in bases:
+    _collect_api_paths(text, endpoints)
+    for match in _CONCAT_PATH_RE.finditer(text):
+        path = match.group("path").split("?", 1)[0]
+        for b in bases_by_name.get(match.group("key").lower(), set()):
             if _is_ws_base(b):
                 continue
-            urls.add(_join_base_path(b, path))
-    for b in bases:
-        if _is_ws_base(b) or not _is_origin_only(b):
-            continue
-        for p in api_paths:
-            if _looks_like_api_path(p):
-                urls.add(_join_base_path(b, p))
+            joined = _join_base_path(b, path)
+            if is_syntax_valid_candidate(joined):
+                urls.add(joined)
 
 
 def _maybe_harvest_dex_string(s: str, urls: set[str], endpoints: set[str]) -> None:
@@ -1063,6 +1146,10 @@ def _maybe_harvest_dex_string(s: str, urls: set[str], endpoints: set[str]) -> No
 # ---------------------------------------------------------------------------
 _B64_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 _HEX_ALPHABET = frozenset("0123456789abcdefABCDEF")
+_B64_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,1022}={0,2}(?![A-Za-z0-9+/_-])"
+)
+_HEX_TOKEN_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,1024}(?![0-9A-Fa-f])")
 
 
 def _is_texty(text: str) -> bool:
@@ -1115,27 +1202,35 @@ def _decode_hex_variants(s: str) -> list[str]:
 
 
 def _harvest_encoded(s: str, urls: set[str], endpoints: set[str]) -> None:
-    """盲解 base64/hex 编码的 URL，命中判定器才收，否则静默丢弃。
+    """提取并盲解 base64/hex token，最多递归两层，再交给统一语法判定器。
 
-    不做「识别混淆」，而是把像编码的长 token 盲解后交给 URL 正则 + 域名合法性
-    + 噪音表三重判定。确定性、与 app 无关。密文 URL 常以 dex 字符串常量形式存在。
+    只还原确定性的文本编码；XOR/AES/压缩等无法静态确认的内容由编排层标记待复核。
     """
-    if "://" in s:
-        return  # 明文 URL 已由 _iter_urls 处理，不做重复
-    if len(s) < 16 or len(s) > 1024:
+    if len(s) < 16:
         return
-    for text in _decode_b64_variants(s):
-        for u in _iter_urls(text):
-            u = u.rstrip("\x00")
-            if u and _looks_plausible_url(u) and not is_noise_url(u):
-                urls.add(u)
-        _harvest_config(text, urls, endpoints)
-    for text in _decode_hex_variants(s):
-        for u in _iter_urls(text):
-            u = u.rstrip("\x00")
-            if u and _looks_plausible_url(u) and not is_noise_url(u):
-                urls.add(u)
-        _harvest_config(text, urls, endpoints)
+    pending = {
+        match.group(0)
+        for match in (*_B64_TOKEN_RE.finditer(s), *_HEX_TOKEN_RE.finditer(s))
+    }
+    seen_tokens: set[str] = set()
+    seen_texts: set[str] = set()
+    for _depth in range(2):
+        decoded: set[str] = set()
+        for token in pending - seen_tokens:
+            seen_tokens.add(token)
+            decoded.update(_decode_b64_variants(token))
+            decoded.update(_decode_hex_variants(token))
+        decoded -= seen_texts
+        if not decoded:
+            break
+        seen_texts.update(decoded)
+        pending = set()
+        for text in decoded:
+            for u in _iter_urls(text):
+                urls.add(u.rstrip("\x00"))
+            _harvest_config(text, urls, endpoints)
+            pending.update(match.group(0) for match in _B64_TOKEN_RE.finditer(text))
+            pending.update(match.group(0) for match in _HEX_TOKEN_RE.finditer(text))
 
 
 def _harvest_text(text: str, urls: set[str], endpoints: set[str]) -> None:

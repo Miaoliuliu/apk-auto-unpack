@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from auto_unpack.packer import apkid
 from auto_unpack.packer import packer_sigs as ps
 
 
@@ -102,11 +103,62 @@ def test_route_static_fallback():
     assert ps.suggest_route({}) == "static"
 
 
+def test_route_parse_failure_is_not_static():
+    sig = {
+        "matched": [], "vendor_candidates": [], "dex_stub": False,
+        "dex_classes": [], "dex_status": "failed",
+        "dex_parse_failed": [("classes.dex", "bad header")],
+    }
+    assert ps.suggest_route(sig) == "unknown"
+
+
+def test_route_partial_dex_is_not_static():
+    sig = {
+        "matched": [], "vendor_candidates": [], "dex_stub": False,
+        "dex_classes": [3000], "dex_status": "partial",
+    }
+    assert ps.suggest_route(sig) == "unknown"
+
+
+def test_route_weak_vendor_candidate_is_not_static():
+    sig = {
+        "matched": [], "vendor_candidates": [{"key": "ijiami"}],
+        "dex_stub": False, "dex_classes": [3000], "dex_status": "ok",
+    }
+    assert ps.suggest_route(sig) == "unknown"
+
+
+def test_route_multiple_vendors_is_ambiguous():
+    sig = {
+        "matched": [{"key": "qihoo360"}, {"key": "legu"}],
+        "dex_stub": False, "dex_classes": [3000], "dex_status": "ok",
+    }
+    assert ps.suggest_route(sig) == "ambiguous"
+
+
+def test_apkid_vendor_is_not_static():
+    sig = {
+        "matched": [], "vendor_candidates": [], "apkid_packers": ["360 Jiagu"],
+        "dex_stub": False, "dex_classes": [2000], "dex_status": "ok",
+    }
+    assert ps.suggest_route(sig) == "vendor"
+
+
 # ---------------------------------------------------------------------------
 # has_payload_dex / dex_unreadable / class_shortfall：业务 dex 判定
 # ---------------------------------------------------------------------------
 def test_has_payload_dex_true():
     assert ps.has_payload_dex({"dex_stub": False, "dex_classes": [5000]}) is True
+
+
+def test_small_valid_dex_is_not_strong_stub():
+    info = {
+        "dex": [{"name": "classes.dex", "classes": 10}],
+        "stub": False, "encrypted_dex": [], "parse_failed": [],
+    }
+    # The size heuristic remains available through _stub_like, but is not
+    # exported as a definitive dex_stub signal.
+    assert ps._stub_like(info) is True
 
 
 def test_has_payload_dex_false_when_stub():
@@ -205,7 +257,7 @@ def test_judge_dpt_standard():
         "dpt_shell_files": ["i11111i111.zip"],
         "asset_payloads": [], "application": None, "appcomponentfactory": False,
     })
-    dpt_shell, dpt_type, evidence, gen = ps._judge_dpt(sig)
+    dpt_shell, dpt_type, evidence, _ = ps._judge_dpt(sig)
     assert dpt_shell is True
     assert dpt_type == "standard"
     assert "i11111i111.zip" in " ".join(evidence)
@@ -225,7 +277,7 @@ def test_judge_dpt_modified_native_symbol():
 def test_judge_dpt_appended_zip():
     """内嵌 ZIP：classes.dex 尾部接 ZIP（dpt-unpack 机制）。"""
     sig = _mk_signals(appended_zip={"offset": 100, "zip_len": 512, "endian": "little"})
-    dpt_shell, dpt_type, evidence, _ = ps._judge_dpt(sig)
+    dpt_shell, dpt_type, _, _ = ps._judge_dpt(sig)
     assert dpt_shell is True
     assert dpt_type == "appended"
 
@@ -253,7 +305,7 @@ def test_judge_dpt_suspected_factory_stub_assets():
         },
         dex_info={"stub": True, "dex": [{"name": "classes.dex", "classes": 1}]},
     )
-    dpt_shell, dpt_type, evidence, _ = ps._judge_dpt(sig)
+    dpt_shell, dpt_type, _, _ = ps._judge_dpt(sig)
     assert dpt_shell is True
     assert dpt_type == "suspected"
 
@@ -432,3 +484,222 @@ def test_judge_custom_family_none():
     assert r["custom_family"] is None
     assert r["custom_packer"] is False
     assert r["custom_packer_strong"] is False
+
+
+# ---------------------------------------------------------------------------
+# P1 修复：libexec*.so 与爱加密特征冲突 → so 内容 dpt 独有路径名复核
+# ---------------------------------------------------------------------------
+def test_judge_dpt_modified_conflict_so():
+    """旧版 dpt 壳 so 与爱加密同名 libexec.so：so 含 dpt 独有路径名 → 魔改 dpt。"""
+    sig = _mk_signals(so_content={
+        "dpt_shell_so": [],
+        "dpt_shell_so_weak": ["lib/armeabi-v7a/libexec.so"],
+    })
+    dpt_shell, dpt_type, evidence, _ = ps._judge_dpt(sig)
+    assert dpt_shell is True
+    assert dpt_type == "modified"
+    assert "libexec.so" in " ".join(evidence)
+
+
+def test_route_dpt_conflict_beats_vendor():
+    """冲突复核成立后，dpt 路由优先于爱加密 matched（不再落到 unsupported）。"""
+    sig = {"edition": None, "vmp": False, "dpt_shell": True,
+           "dpt_type": "modified", "custom_family": None,
+           "matched": [{"vendor": "爱加密", "key": "ijiami"}],
+           "dex_stub": True, "dex_classes": [1]}
+    assert ps.suggest_route(sig) == "dpt"
+
+
+class _FakeApkView:
+    """最小 _ApkView 替身：_scan_so_content / _detect_dpt_files 只用 read/files。"""
+
+    def __init__(self, files_map):
+        self._files = files_map
+        self.files = list(files_map)
+
+    def read(self, name):
+        return self._files[name]
+
+
+def test_scan_so_content_conflict_string_hit():
+    """so 内容含 OoooooOooo（dpt 独有）但不满足 REQUIRED → 记入 weak，不进强判定。"""
+    so = b"\x7fELF" + b"...OoooooOooo/others..." + b"\x00" * 16
+    view = _FakeApkView({"lib/armeabi-v7a/libexec.so": so})
+    r = ps._scan_so_content(view, ["lib/armeabi-v7a/libexec.so"])
+    assert r["dpt_shell_so"] == []
+    assert r["dpt_shell_so_weak"] == ["lib/armeabi-v7a/libexec.so"]
+
+
+def test_scan_so_content_no_conflict_string():
+    so = b"\x7fELF" + b"plain business library" + b"\x00" * 16
+    view = _FakeApkView({"lib/arm64-v8a/libbusiness.so": so})
+    r = ps._scan_so_content(view, ["lib/arm64-v8a/libbusiness.so"])
+    assert r["dpt_shell_so"] == []
+    assert r["dpt_shell_so_weak"] == []
+
+
+# ---------------------------------------------------------------------------
+# P2 修复：stub 强弱分级（ProxyApplication 是插件化框架常用名）
+# ---------------------------------------------------------------------------
+def test_dpt_app_stub_levels():
+    assert ps._dpt_app_stub_level("com.luoyesiqiu.shell.ProxyApplication") == "strong"
+    assert ps._dpt_app_stub_level("com.nashsiqiu.shell.StubApp") == "strong"
+    assert ps._dpt_app_stub_level("com.example.MainProxyApplication") == "weak"
+    assert ps._dpt_app_stub_level("com.example.MyProxyComponentFactory") == "weak"
+    assert ps._dpt_app_stub_level("com.example.MainApplication") == "none"
+    assert ps._dpt_app_stub_level(None) == "none"
+
+
+def test_judge_dpt_weak_stub_alone_false():
+    """弱 stub 单独命中（无任何壳行为佐证）→ 不判 dpt，防插件化框架误报。"""
+    sig = _mk_signals(feats={
+        "dpt_primary_files": [], "dpt_shell_files": [],
+        "asset_payloads": [],
+        "application": "com.example.MainProxyApplication",
+        "appcomponentfactory": False,
+    })
+    dpt_shell, dpt_type, _, _ = ps._judge_dpt(sig)
+    assert dpt_shell is False
+    assert dpt_type is None
+
+
+def test_judge_dpt_weak_stub_with_factory_suspected():
+    """弱 stub + appComponentFactory 声明 → suspected（保守，不抢 vendor 路由）。"""
+    sig = _mk_signals(feats={
+        "dpt_primary_files": [], "dpt_shell_files": [],
+        "asset_payloads": [],
+        "application": "com.example.MainProxyApplication",
+        "appcomponentfactory": True,
+    })
+    dpt_shell, dpt_type, evidence, _ = ps._judge_dpt(sig)
+    assert dpt_shell is True
+    assert dpt_type == "suspected"
+    assert "appComponentFactory" in evidence
+
+
+def test_judge_dpt_weak_stub_with_dex_stub_suspected():
+    """弱 stub + 根 dex 是壳 → suspected。"""
+    sig = _mk_signals(
+        feats={
+            "dpt_primary_files": [], "dpt_shell_files": [],
+            "asset_payloads": [],
+            "application": "com.example.ProxyApplication",
+            "appcomponentfactory": False,
+        },
+        dex_info={"stub": True, "dex": [{"name": "classes.dex", "classes": 1}]},
+    )
+    dpt_shell, dpt_type, evidence, _ = ps._judge_dpt(sig)
+    assert dpt_shell is True
+    assert dpt_type == "suspected"
+    assert any(str(e).startswith("dex_stub") for e in evidence)
+
+
+# ---------------------------------------------------------------------------
+# P3 修复：appComponentFactory 兼容 UTF-16LE 字符串池
+# ---------------------------------------------------------------------------
+def test_axml_string_present_utf8_and_utf16():
+    assert ps._axml_string_present(b"xx appComponentFactory yy", "appComponentFactory") is True
+    utf16 = "appComponentFactory".encode("utf-16-le")
+    assert ps._axml_string_present(b"\x03\x00\x01\x00" + utf16 + b"\x00\x00", "appComponentFactory") is True
+    assert ps._axml_string_present(b"nothing here", "appComponentFactory") is False
+    assert ps._axml_string_present(b"", "appComponentFactory") is False
+
+
+def test_detect_dpt_files_utf16_manifest():
+    """UTF-16LE 字符串池的 manifest（灰产重打包常见）不再漏检 factory。"""
+    manifest = b"\x03\x00" + "appComponentFactory".encode("utf-16-le") + b"\x00\x00"
+    view = _FakeApkView({"AndroidManifest.xml": manifest})
+    _, has = ps._detect_dpt_files(["AndroidManifest.xml"], view)
+    assert has is True
+
+
+def test_detect_dpt_files_utf8_manifest():
+    manifest = b"prefix appComponentFactory suffix"
+    view = _FakeApkView({"AndroidManifest.xml": manifest})
+    _, has = ps._detect_dpt_files(["AndroidManifest.xml"], view)
+    assert has is True
+
+
+# ---------------------------------------------------------------------------
+# P4 修复：内嵌 ZIP header fallback 需条目佐证（dpt 特征名或多条目）
+# ---------------------------------------------------------------------------
+def _mk_dex_with_trailing_zip(entries):
+    """构造 file_size=0x70 的 dex 头 + 尾部合法 ZIP（模拟 header fallback 场景）。"""
+    import io
+    import zipfile as _zf
+    buf = io.BytesIO()
+    with _zf.ZipFile(buf, "w") as z:
+        for n in entries:
+            z.writestr(n, b"payload-data" * 8)
+    dex = bytearray(b"dex\n035\x00" + b"\x00" * (0x70 - 8))
+    dex[32:36] = (0x70).to_bytes(4, "little")
+    return bytes(dex) + buf.getvalue()
+
+
+def test_appended_zip_header_single_foreign_entry_rejected():
+    """尾部单条目无关 ZIP（对齐 padding 场景）→ 不再误判内嵌 ZIP。"""
+    data = _mk_dex_with_trailing_zip(["readme.txt"])
+    assert ps._appended_zip_in_dex_bytes(data) is None
+
+
+def test_appended_zip_header_dpt_entry_hit():
+    data = _mk_dex_with_trailing_zip(["i11111i111.zip"])
+    hit = ps._appended_zip_in_dex_bytes(data)
+    assert hit is not None
+    assert hit["endian"] == "header"
+    assert hit["offset"] == 0x70
+
+
+def test_appended_zip_header_multi_entry_hit():
+    data = _mk_dex_with_trailing_zip(["a.bin", "b.cfg"])
+    hit = ps._appended_zip_in_dex_bytes(data)
+    assert hit is not None
+    assert hit["endian"] == "header"
+
+
+def test_vendor_weak_filename_is_candidate_only():
+    feats = {
+        "lib_sos": {"libexecinfo.so"},
+        "asset_so_names": set(),
+        "asset_names": set(),
+        "application": None,
+    }
+    assert ps._match_vendors(feats) == []
+    candidates = ps._match_vendor_candidates(feats)
+    assert candidates and candidates[0]["confirmed"] is False
+    assert candidates[0]["evidence_strength"] == "weak"
+
+
+def test_vendor_strong_filename_is_confirmed():
+    feats = {
+        "lib_sos": {"libjiagu.so"},
+        "asset_so_names": set(),
+        "asset_names": set(),
+        "application": None,
+    }
+    assert [m["key"] for m in ps._match_vendors(feats)] == ["qihoo360"]
+
+
+def test_path_matching_is_case_insensitive_and_rejects_traversal():
+    assert ps._collect_file_names([
+        "Lib/arm64-v8a/libjiagu.so",
+        "Assets/libshellx.so",
+        "../fake/lib/arm64-v8a/libjiagu.so",
+    ]) == ({"libjiagu.so"}, {"libshellx.so"}, {"libshellx.so"})
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("360 Jiagu", "unpacker/flow_360.py"),
+    ("Alibaba", "unpacker/flow_ali.py"),
+])
+def test_apkid_alias_resolution(name, expected):
+    assert apkid.resolve_flows([name]) == [expected]
+
+
+@pytest.mark.parametrize("name", ["ali", "op", "sec"])
+def test_apkid_short_name_does_not_resolve(name):
+    assert apkid.resolve_flow([name]) is None
+
+
+def test_apkid_multiple_packers_are_ambiguous():
+    assert len(apkid.resolve_flows(["360", "tencent"])) == 2

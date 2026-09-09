@@ -166,6 +166,26 @@ def test_cli_detect_sets_detect_only(monkeypatch, tmp_path: Path):
     assert seen.get("detect_only") is True
 
 
+def test_cli_forwards_network_validation_options(monkeypatch, tmp_path: Path):
+    apk = tmp_path / "one.apk"
+    apk.write_bytes(b"PK")
+    seen: dict = {}
+
+    def fake_run(apk, **kwargs):
+        seen.update(kwargs)
+        return _ok_report()
+
+    monkeypatch.setattr("auto_unpack.flow.pipeline.run", fake_run)
+    assert main([
+        "analyze", str(apk), "--validate-http", "--allow-private-http",
+        "--validation-timeout", "1.25",
+    ]) == 0
+    assert seen["validate_dns"] is False
+    assert seen["validate_http"] is True
+    assert seen["allow_private_http"] is True
+    assert seen["validation_timeout"] == 1.25
+
+
 def test_cli_inbox_flag(monkeypatch, tmp_path: Path):
     drop = tmp_path / "drop"
     drop.mkdir()

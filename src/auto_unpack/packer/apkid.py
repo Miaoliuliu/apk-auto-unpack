@@ -15,6 +15,7 @@ UNPACK_FLOWS / IMPLEMENTED_FLOWS 是 packer key → 脱壳插件的注册表，
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -67,10 +68,6 @@ def decide_route(sig: dict, *, generation: int = 0, has_shell: bool = False) -> 
     if has_shell:
         merged["has_shell"] = True
     route = suggest_route(merged)
-    if route == "unknown":
-        packers = list(merged.get("apkid_packers") or [])
-        if packers and resolve_flow(packers):
-            return "vendor"
     return route
 
 
@@ -95,7 +92,7 @@ def merge_apkid(sig: dict, info: dict | None) -> dict:
     else:
         vmp_source = None
     generation = int(sig.get("generation") or 0)
-    has_packer = "packer" in tags
+    has_packer = "packer" in tags or bool(packers)
     # anti_hook 不进 suspicious：无壳 app 自带反 Xposed 代码很常见
     # （湖州小众通联批次 OpenIM Flutter 样本因 anti_hook 被误判「未知壳」），
     # 与 anti_vm/anti_debug 一样只作参考信息，不参与壳判定。
@@ -125,9 +122,15 @@ def needs_apkid(sig: dict) -> bool:
         return False
     if sig.get("dpt_shell"):
         return False
-    if sig.get("matched"):
-        return False
-    return True
+    if sig.get("dex_status") in ("failed", "partial"):
+        return True
+    if sig.get("vendor_candidates"):
+        return True
+    if len(sig.get("matched") or []) > 1:
+        return True
+    if sig.get("custom_family") or sig.get("dpt_type") == "suspected":
+        return True
+    return not sig.get("matched")
 
 
 def should_run_apkid(sig: dict, *, force: bool = False, skip: bool = False) -> bool:
@@ -156,7 +159,11 @@ def run_apkid(apkid_exe: str, apk: Path) -> tuple[dict | None, str | None]:
     except subprocess.TimeoutExpired:
         return None, "APKiD 扫描超时"
     if proc.returncode != 0:
-        return None, proc.stderr.strip() or f"返回码 {proc.returncode}"
+        return None, (proc.stderr or "").strip() or f"返回码 {proc.returncode}"
+    if len(proc.stdout or "") > 64 * 1024 * 1024:
+        return None, "APKiD stdout 超过 64 MiB 限制"
+    if len(proc.stderr or "") > 8 * 1024 * 1024:
+        return None, "APKiD stderr 超过 8 MiB 限制"
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
@@ -170,11 +177,25 @@ def classify(data: dict) -> dict:
     tags: dict[str, int] = {}
     packers: set[str] = set()
     nested_dex = 0
-    for f in data.get("files", []):
+    if not isinstance(data, dict):
+        return {"tags": tags, "packers": [], "nested_dex": 0, "file_count": 0}
+    files = data.get("files", [])
+    if not isinstance(files, list):
+        files = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
         fn = f.get("filename", "")
+        if not isinstance(fn, str):
+            fn = ""
         if fn.count("!") >= 2 and "classes" in fn:
             nested_dex += 1
-        for tag_key, rules in f.get("matches", {}).items():
+        matches = f.get("matches", {})
+        if not isinstance(matches, dict):
+            continue
+        for tag_key, rules in matches.items():
+            if not isinstance(tag_key, str):
+                continue
             tag_list = [t.strip() for t in tag_key.split(",")]
             n = len(rules) if isinstance(rules, list) else 1
             for t in tag_list:
@@ -188,18 +209,67 @@ def classify(data: dict) -> dict:
         "tags": tags,
         "packers": sorted(packers),
         "nested_dex": nested_dex,
-        "file_count": len(data.get("files", [])),
+        "file_count": len(files),
     }
 
 
 def resolve_flow(packers: list[str]) -> str | None:
     """按 packer 名（大小写不敏感子串双向）找脱壳插件；找不到返回 None。"""
-    for name in packers:
-        low = name.lower()
-        for flow, keys in UNPACK_FLOWS.items():
-            if any(key in low or low in key for key in keys):
-                return flow
+    flows = resolve_flows(packers)
+    return flows[0] if len(flows) == 1 else None
+
+
+_APKiD_ALIASES = {
+    "360": "qihoo360", "qihoo": "qihoo360", "jiagu": "qihoo360",
+    "legu": "legu", "tencent": "legu",
+    "ijiami": "ijiami", "ai jiami": "ijiami",
+    "bangcle": "bangcle", "secneo": "bangcle",
+    "naga": "naga", "alibaba": "alibaba",
+    "baidu": "baidu", "yidun": "yidun", "netease": "yidun",
+    "dingxiang": "dingxiang", "tongfu": "tongfu",
+    "eversafe": "eversafe", "liapp": "liapp", "vplusplus": "vplusplus",
+    "v++": "vplusplus", "oppo": "oppo",
+}
+
+
+def _canonical_apkid_key(name: str) -> str | None:
+    low = re.sub(r"[^a-z0-9+]+", " ", str(name).casefold()).strip()
+    if not low:
+        return None
+    for alias, key in _APKiD_ALIASES.items():
+        alias_low = alias.casefold()
+        if low == alias_low or alias_low in low.split():
+            return key
     return None
+
+
+def resolve_flows(packers: list[str]) -> list[str]:
+    """Resolve explicit APKiD aliases without short reverse substring matches."""
+    flows: set[str] = set()
+    canonical_flow = {
+        "qihoo360": "unpacker/flow_360.py",
+        "legu": "unpacker/flow_legu.py",
+        "ijiami": "unpacker/flow_ijiami.py",
+        "bangcle": "unpacker/flow_bangcle.py",
+        "naga": "unpacker/flow_naga.py",
+        "alibaba": "unpacker/flow_ali.py",
+        "baidu": "unpacker/flow_baidu.py",
+        "yidun": "unpacker/flow_netease.py",
+        "dingxiang": "unpacker/flow_dingxiang.py",
+        "tongfu": "unpacker/flow_tongfu.py",
+        "eversafe": "unpacker/flow_eversafe.py",
+        "liapp": "unpacker/flow_liapp.py",
+        "vplusplus": "unpacker/flow_vplusplus.py",
+        "oppo": "unpacker/flow_oppo.py",
+    }
+    for name in packers or []:
+        key = _canonical_apkid_key(str(name))
+        if not key:
+            continue
+        flow = canonical_flow.get(key)
+        if flow:
+            flows.add(flow)
+    return sorted(flows)
 
 
 def main(argv: list[str] | None = None) -> int:

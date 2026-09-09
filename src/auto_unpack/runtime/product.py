@@ -174,7 +174,7 @@ def default_dex_dir(apk_path: str | None, package: str | None = None,
 
 def default_url_dir(apk_path: str | None, package: str | None = None,
                     trusted: bool = False) -> Path:
-    """URL 清单：extracted_urls/<apk文件名>/（目录内只放 urls_by_rank.txt）"""
+    """URL 产物：extracted_urls/<apk文件名>/（分级、纯 URL、JSONL、报告）。"""
     return product_root() / URL_PRODUCT_ROOT / safe_product_stem(
         apk_path, package, trusted
     )

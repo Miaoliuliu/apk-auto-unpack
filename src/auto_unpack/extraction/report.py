@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .indicators import RANK_CONF as _RANK_CONF
 from ..constants import (
     COMPLETED,
     E_DETECT,
@@ -26,10 +25,10 @@ from ..constants import (
     UNPACK_CORRUPTED,
     UNPACK_MANUAL,
     UNPACK_NOT_INSTALLED,
-    UNPACK_SKIPPED,
     UNPACK_UNSUPPORTED,
     now_iso,
 )
+from .indicators import RANK_SCORE as _RANK_SCORE
 
 EXIT_OK = 0
 EXIT_NO_URL = 1
@@ -84,17 +83,22 @@ def packer_label(packed: bool | str, name: str | None) -> str:
     return name or "unknown"
 
 
-def url_confidence(item: dict) -> float:
-    if item.get("confidence") is not None:
+def business_likelihood(item: dict) -> float:
+    if item.get("business_likelihood") is not None:
         try:
-            return float(item["confidence"])
+            return float(item["business_likelihood"])
         except (TypeError, ValueError):
             pass
-    return _RANK_CONF.get(item.get("rank") or "", 0.4)
+    return _RANK_SCORE.get(item.get("rank") or "", 0.4)
+
+
+def url_confidence(item: dict) -> float:
+    """兼容旧调用方；该值仅表示业务相关性，不代表 URL 有效或可达。"""
+    return business_likelihood(item)
 
 
 def project_url(item: dict) -> dict:
-    """每条 URL：value / type / source_file / source_kind / confidence。"""
+    """投影网络指标，明确区分业务相关性与语法/DNS/HTTP 验证。"""
     sources = item.get("sources") or []
     src = sources[0] if sources else {}
     value = item.get("value") or item.get("url") or ""
@@ -103,11 +107,16 @@ def project_url(item: dict) -> dict:
         "type": item.get("type") or "url",
         "source_file": public_name(src.get("file")) or src.get("file"),
         "source_kind": src.get("type") or item.get("source_kind") or "unknown",
-        "confidence": url_confidence(item),
+        "business_likelihood": business_likelihood(item),
         "url": item.get("url") or value,
         "rank": item.get("rank"),
         "host": item.get("host"),
         "canonical": item.get("canonical"),
+        "observed_value": item.get("observed_value") or value,
+        "scheme": item.get("scheme"),
+        "port": item.get("port"),
+        "path": item.get("path"),
+        "validation": dict(item.get("validation") or {"syntax": "unknown"}),
         "sources": [
             {
                 "type": s.get("type"),
@@ -196,20 +205,38 @@ def _has_runtime_warning(task) -> bool:
 
 
 def _project_urls(task) -> tuple[list[dict], dict, str]:
-    """URL 投影 + 类型计数 + 提取状态（failed / empty / needs_review / ok）。"""
+    """URL 投影 + 类型计数 + 提取状态（failed / empty / needs_review / partial / ok）。"""
     urls = [project_url(u) for u in (task.urls or [])]
     types = {"url": 0, "domain": 0, "ip": 0}
     for u in urls:
         t = u.get("type") or "url"
         types[t] = types.get(t, 0) + 1
     extract_err = (task.error or {}).get("code") == E_EXTRACT
+    stats = getattr(task, "extraction_stats", {}) or {}
+    failed_sources = any(stats.get(key) for key in (
+        "parse_failed", "encrypted_dex", "malformed_dex", "strings_failed",
+        "source_errors", "source_skipped",
+    ))
+    runtime_warning = _has_runtime_warning(task)
     if extract_err:
         extraction_status = "failed"
     elif not urls:
-        extraction_status = "needs_review" if _has_runtime_warning(task) else "empty"
+        extraction_status = "needs_review" if runtime_warning or failed_sources else "empty"
+    elif runtime_warning or failed_sources:
+        extraction_status = "partial"
     else:
         extraction_status = "ok"
     return urls, types, extraction_status
+
+
+def _validation_summary(urls: list[dict]) -> dict:
+    summary: dict[str, dict[str, int]] = {"syntax": {}, "dns": {}, "http": {}}
+    for item in urls:
+        validation = item.get("validation") or {}
+        for dimension, counts in summary.items():
+            status = validation.get(dimension) or "unknown"
+            counts[status] = counts.get(status, 0) + 1
+    return summary
 
 
 def _build_packer_detection(task, packed: bool | str, name: str | None, candidates: list[str]) -> dict:
@@ -281,7 +308,9 @@ def build_report(task) -> dict:
             "url_count": len(urls),
             "url_type": types,
             "url_completeness": (task.packer or {}).get("url_completeness"),
-            "confidence": (task.packer or {}).get("url_confidence"),
+            "completeness_confidence": (task.packer or {}).get("url_confidence"),
+            "validation": _validation_summary(urls),
+            "stats": dict(getattr(task, "extraction_stats", {}) or {}),
         },
         "urls": urls,
         "url_summary": {

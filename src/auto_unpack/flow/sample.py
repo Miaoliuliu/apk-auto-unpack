@@ -121,7 +121,7 @@ def ingest(apk_path: str | Path, *, out_dir: str | None = None,
            package: str | None = None, trusted: bool = False) -> dict:
     """校验 + 哈希。返回 sample 字典（含 url_dir / out_dir）。
 
-    url_dir：只放 urls_by_rank.txt，默认 extracted_urls/<apk名>/（可 -o 覆盖）
+    url_dir：放分级清单、纯 URL、JSONL 和报告，默认 extracted_urls/<apk名>/（可 -o 覆盖）
     dex_dir：仅在真正动态脱壳时由 pipeline 再写入 unpacked_dex/<apk名>/
     """
     p = Path(apk_path).resolve()
@@ -129,7 +129,7 @@ def ingest(apk_path: str | Path, *, out_dir: str | None = None,
     hashes = hash_file(p)
     stem = safe_product_stem(str(p), package, trusted)
     url_dest = Path(out_dir) if out_dir else default_url_dir(str(p), package, trusted)
-    # URL 目录延后到真正写出 urls_by_rank.txt 时再创建
+    # URL 目录延后到真正写出提取产物时再创建
     meta = read_apk_meta(p)
     pkg = package or meta.get("package_name")
     return {

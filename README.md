@@ -35,6 +35,8 @@ auto-unpack analyze <app.apk>                      # 单个完整分析
 auto-unpack detect <app.apk>                       # 只识别壳（不脱壳不抽 URL）
 auto-unpack analyze                                 # 批量分析 APK/ 下全部
 auto-unpack analyze <app.apk> --unpack --package com.example.app
+auto-unpack analyze <app.apk> --validate-dns        # 可选 DNS 验证
+auto-unpack analyze <app.apk> --validate-http       # 可选 HTTP HEAD（默认不探测私网）
 ```
 
 退出码：`0` 成功 / `1` 无 URL / `2` 输入非法 / `3` 识别失败 / `4` 脱壳失败 / `5` 其它失败。
@@ -68,7 +70,7 @@ auto-unpack analyze <app.apk> --unpack --package com.example.app
 ├── outputs/            产物目录（运行时生成，不入库）
 │   ├── packer_detection/  按壳名归档
 │   ├── unpacked_dex/      动态脱壳 dex
-│   └── extracted_urls/    urls_by_rank.txt
+│   └── extracted_urls/    urls_by_rank.txt + urls.txt + indicators.jsonl + meta.json
 ├── APK/                待分析 APK 入口（运行时，不入库）
 ├── 项目文档/           PRD、项目总览等长期文档
 └── pyproject.toml

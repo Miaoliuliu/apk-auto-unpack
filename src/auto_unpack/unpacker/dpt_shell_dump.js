@@ -6,8 +6,16 @@
 //
 // Android 8+ mCookie 可能是 long[]（[0]=OatFile*，其余 DexFile*），
 // 或单个 jlong（指向 std::vector<DexFile*>）。两种都试。
+//
+// U1：dpt 的指令回填发生在 LoadMethod 过程中，onEnter 首轮可能抓到未回填的
+//     抽取态。主动重扫轮（triggerLoad）允许对同一 DexFile 再 dump 一次
+//     （round=2，Python 端按方法体空占比择优保留），不再被去重锁死。
+// U2：每 classloader 主动 loadClass 上限 80 → 500；触发轮 3s/8s → 3s/8s/15s。
+// U9：大 dex 分块发送（4MB/块），避免 Frida 单次 send 大 buffer 截断。
 
-var dumped = {};
+var dumped = {};            // key -> 已 dump 轮次数
+var MAX_ROUNDS = 2;         // 每个 DexFile 最多 dump 轮数（1=首轮，2=重扫补捞）
+var CHUNK_SIZE = 4 * 1024 * 1024;
 
 function isDexMagic(begin) {
     try {
@@ -20,7 +28,24 @@ function isDexMagic(begin) {
     }
 }
 
-function dumpDexFile(dexFilePtr) {
+function sendDexBytes(begin, fileSize, round) {
+    var base = { type: "dex", begin: begin.toString(), size: fileSize, round: round };
+    if (fileSize <= CHUNK_SIZE) {
+        send(base, Memory.readByteArray(begin, fileSize));
+        return;
+    }
+    // U9：分块发送，Python 端 _ChunkAssembler 按 begin 重组
+    var total = Math.ceil(fileSize / CHUNK_SIZE);
+    send({ type: "dex-begin", begin: begin.toString(), size: fileSize,
+           round: round, chunks: total });
+    for (var i = 0, off = 0; off < fileSize; i++, off += CHUNK_SIZE) {
+        var n = Math.min(CHUNK_SIZE, fileSize - off);
+        send({ type: "dex-chunk", begin: begin.toString(), seq: i },
+             Memory.readByteArray(begin.add(off), n));
+    }
+}
+
+function dumpDexFile(dexFilePtr, allowRedump) {
     try {
         if (!dexFilePtr || dexFilePtr.isNull()) return false;
         var begins = [dexFilePtr.add(8).readPointer()];
@@ -32,11 +57,13 @@ function dumpDexFile(dexFilePtr) {
             var headerSize = begin.add(0x24).readU32();
             if (headerSize !== 0x70 || fileSize < 0x70 || fileSize > 0x10000000) continue;
             var key = begin.toString() + "_" + fileSize;
-            if (dumped[key]) return true;
-            dumped[key] = 1;
-            var bytes = Memory.readByteArray(begin, fileSize);
-            send({ type: "dex", begin: begin.toString(), size: fileSize }, bytes);
-            console.log("[+] dump dex " + begin + " size=" + fileSize);
+            var rounds = dumped[key] || 0;
+            if (rounds >= MAX_ROUNDS) return true;
+            if (rounds > 0 && !allowRedump) return true;
+            dumped[key] = rounds + 1;
+            sendDexBytes(begin, fileSize, rounds + 1);
+            console.log("[+] dump dex " + begin + " size=" + fileSize
+                + " round=" + (rounds + 1));
             return true;
         }
     } catch (e) {}
@@ -67,11 +94,11 @@ function hookClassLinker(kind) {
         console.log("[*] " + kind + " DexFile=args[" + idx + "] " + exp.name);
         Interceptor.attach(exp.address, {
             onEnter: function (args) {
-                dumpDexFile(args[idx]);
-                if (kind === "DefineClass") dumpDexFile(args[6]);
+                dumpDexFile(args[idx], false);
+                if (kind === "DefineClass") dumpDexFile(args[6], false);
                 if (kind === "LoadMethod") {
-                    dumpDexFile(args[1]);
-                    dumpDexFile(args[2]);
+                    dumpDexFile(args[1], false);
+                    dumpDexFile(args[2], false);
                 }
             }
         });
@@ -85,7 +112,7 @@ function javaLongToPtr(jlong) {
     return ptr("0x" + hex);
 }
 
-function dumpStdVectorDex(vecPtr) {
+function dumpStdVectorDex(vecPtr, allowRedump) {
     try {
         var b = vecPtr.readPointer();
         var e = vecPtr.add(Process.pointerSize).readPointer();
@@ -94,18 +121,18 @@ function dumpStdVectorDex(vecPtr) {
         var n = nbytes / Process.pointerSize;
         if (n > 128) return;
         for (var i = 0; i < n; i++) {
-            dumpDexFile(b.add(i * Process.pointerSize).readPointer());
+            dumpDexFile(b.add(i * Process.pointerSize).readPointer(), allowRedump);
         }
     } catch (e) {}
 }
 
-function dumpCookie(cookie) {
+function dumpCookie(cookie, allowRedump) {
     if (cookie === null || cookie === undefined) return;
     function fromLong(v) {
         if (!v) return;
         var p = javaLongToPtr(v);
-        dumpDexFile(p);
-        dumpStdVectorDex(p);
+        dumpDexFile(p, allowRedump);
+        dumpStdVectorDex(p, allowRedump);
     }
     try {
         var longArr = Java.cast(cookie, Java.use("[J"));
@@ -117,19 +144,19 @@ function dumpCookie(cookie) {
     } catch (e2) {}
 }
 
-function dumpJavaDexFileObj(df) {
+function dumpJavaDexFileObj(df, allowRedump) {
     if (!df) return;
     var DexFile = Java.use("dalvik.system.DexFile");
     ["mCookie", "mInternalCookie"].forEach(function (name) {
         try {
             var f = DexFile.class.getDeclaredField(name);
             f.setAccessible(true);
-            dumpCookie(f.get(df));
+            dumpCookie(f.get(df), allowRedump);
         } catch (e) {}
     });
 }
 
-function dumpFromClassLoader(loader) {
+function dumpFromClassLoader(loader, allowRedump) {
     try {
         var PathClassLoader = Java.use("dalvik.system.BaseDexClassLoader");
         var pathListField = PathClassLoader.class.getDeclaredField("pathList");
@@ -160,29 +187,31 @@ function dumpFromClassLoader(loader) {
                 }
             } catch (e2) {}
             if (!df) continue;
-            dumpJavaDexFileObj(df);
+            dumpJavaDexFileObj(df, allowRedump);
             try {
                 var en = df.entries();
                 var n = 0;
-                var MAX = 80;
+                // U2：80 → 500。业务 dex 数千类，80 个触发面太小，
+                // 未加载的类在 dpt 回填前 dump 会缺方法体。
+                var MAX = 500;
                 while (en.hasMoreElements() && n < MAX) {
                     try { loader.loadClass(en.nextElement()); } catch (e2) {}
                     n++;
                 }
                 console.log("[*] 触发 loadClass " + n + " 个类");
             } catch (e2) {}
-            dumpJavaDexFileObj(df);
+            dumpJavaDexFileObj(df, true);
         }
     } catch (e) {
         console.log("[!] ClassLoader dump: " + e);
     }
 }
 
-function triggerLoad() {
+function triggerLoad(round) {
     Java.perform(function () {
         try {
             Java.enumerateClassLoaders({
-                onMatch: dumpFromClassLoader,
+                onMatch: function (loader) { dumpFromClassLoader(loader, true); },
                 onComplete: function () {}
             });
         } catch (e) {
@@ -190,7 +219,7 @@ function triggerLoad() {
         }
         try {
             Java.choose("dalvik.system.DexFile", {
-                onMatch: dumpJavaDexFileObj,
+                onMatch: function (df) { dumpJavaDexFileObj(df, true); },
                 onComplete: function () {}
             });
         } catch (e2) {
@@ -201,6 +230,7 @@ function triggerLoad() {
 
 hookClassLinker("DefineClass");
 hookClassLinker("LoadMethod");
-setTimeout(triggerLoad, 3000);
-setTimeout(triggerLoad, 8000);
+setTimeout(function () { triggerLoad(1); }, 3000);
+setTimeout(function () { triggerLoad(2); }, 8000);
+setTimeout(function () { triggerLoad(3); }, 15000);
 console.log("[*] dpt-shell dump 脚本就绪");

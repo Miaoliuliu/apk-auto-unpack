@@ -35,7 +35,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "-o", "--out",
-        help="URL 输出目录（默认 extracted_urls/<apk文件名>，目录内只放 urls_by_rank.txt；"
+        help="URL 输出目录（默认 extracted_urls/<apk文件名>，含分级清单、纯 URL 和 JSONL；"
              "dex 在 unpacked_dex/）。"
              "批量时忽略此参数，每个 APK 仍写到各自默认目录",
     )
@@ -77,6 +77,10 @@ def _run_one(args, apk: Path, *, detect_only: bool, out_dir: str | None) -> tupl
         timeout=getattr(args, "timeout", None),
         install=install_from_args(args),
         detect_only=detect_only,
+        validate_dns=bool(getattr(args, "validate_dns", False)),
+        validate_http=bool(getattr(args, "validate_http", False)),
+        allow_private_http=bool(getattr(args, "allow_private_http", False)),
+        validation_timeout=float(getattr(args, "validation_timeout", 3.0)),
     )
     print_cli_report(report)
     return exit_code(report), report
@@ -184,6 +188,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_an = sub.add_parser("analyze", help="完整流水线：识别 →（可选）脱壳 → 提取 URL")
     _add_common(p_an)
+    p_an.add_argument("--validate-dns", action="store_true",
+                      help="对提取到的 host 做 DNS 解析并记录状态")
+    p_an.add_argument("--validate-http", action="store_true",
+                      help="显式发起 HTTP HEAD（同时启用 DNS）")
+    p_an.add_argument("--allow-private-http", action="store_true",
+                      help="允许 HTTP 探测私有/保留地址；默认阻止")
+    p_an.add_argument("--validation-timeout", type=float, default=3.0,
+                      help="单个 HTTP 连接/响应超时秒数（默认 3；DNS 由系统解析器控制）")
     p_an.add_argument("--deep", action="store_true",
                       help="已废弃（原通用 frida 脱壳）；保留兼容，无效果")
     p_an.set_defaults(_fn=lambda a: _run_analyze(a, detect_only=False))

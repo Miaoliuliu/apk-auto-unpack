@@ -50,15 +50,17 @@ def test_make_indicator_full_url():
     assert i["path"] == "/v1"
     assert i["scheme"] == "https"
     assert i["rank"] == "biz"
-    assert i["confidence"] == 0.9
+    assert i["business_likelihood"] == 0.9
+    assert i["validation"]["syntax"] == "valid"
     assert i["sources"] == [{"type": "dex", "file": "classes.dex", "method": "regex"}]
 
 
-def test_make_indicator_bare_domain_gets_http_scheme():
+def test_make_indicator_bare_domain_preserves_observed_value():
     i = ind.make_indicator("api.myservice.com", "dex", "classes.dex")
     assert i["type"] == "domain"
-    assert i["value"] == "http://api.myservice.com"  # 无 scheme 时补 http 展示
-    assert i["canonical"] == "http://api.myservice.com"
+    assert i["value"] == "api.myservice.com"
+    assert i["canonical"] == "api.myservice.com"
+    assert i["scheme"] is None
     assert i["host"] == "api.myservice.com"
 
 
@@ -194,28 +196,22 @@ def test_harvest_config_json_url_field():
     assert urls == {"https://api.myservice.com"}
 
 
-def test_harvest_config_domain_list_both_schemes():
-    # 无 scheme 域名收割会同时补 http/https 两种 scheme（当前行为）
+def test_harvest_config_domain_list_does_not_invent_schemes():
     urls, eps = set(), set()
     ind._harvest_config('domainList: ["api1.myservice.com", "cdn.myservice.com"]', urls, eps)
-    assert urls == {
-        "http://api1.myservice.com", "https://api1.myservice.com",
-        "http://cdn.myservice.com", "https://cdn.myservice.com",
-    }
+    assert urls == {"api1.myservice.com", "cdn.myservice.com"}
 
 
 # ---------------------------------------------------------------------------
 # merge_indicators：跨来源去重 + https 优先
 # ---------------------------------------------------------------------------
-def test_merge_indicators_http_https_collapse():
+def test_merge_indicators_keeps_http_https_distinct():
     a = ind.make_indicator("http://api.myservice.com", "dex", "classes.dex")
     b = ind.make_indicator("https://api.myservice.com", "assets", "www/app.js")
     m = ind.merge_indicators([a, b])
-    assert len(m) == 1
-    assert m[0]["url"].startswith("https://")  # https 优先
-    assert {(s["type"], s["file"]) for s in m[0]["sources"]} == {
-        ("dex", "classes.dex"), ("assets", "www/app.js"),
-    }
+    assert [item["url"] for item in m] == [
+        "http://api.myservice.com", "https://api.myservice.com",
+    ]
 
 
 def test_merge_indicators_tolerates_none():
@@ -225,14 +221,19 @@ def test_merge_indicators_tolerates_none():
 # ---------------------------------------------------------------------------
 # fold_related_urls：scheme/query 变体折叠
 # ---------------------------------------------------------------------------
-def test_fold_related_urls_single_survivor():
+def test_fold_related_urls_preserves_observed_variants():
     got = ind.fold_related_urls({
         "http://api.myservice.com/x",
         "https://api.myservice.com/x",
         "https://api.myservice.com/x?utm_source=1",
         "https://api.myservice.com/x?utm_source=2",
     })
-    assert got == {"https://api.myservice.com/x"}
+    assert got == {
+        "http://api.myservice.com/x",
+        "https://api.myservice.com/x",
+        "https://api.myservice.com/x?utm_source=1",
+        "https://api.myservice.com/x?utm_source=2",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -430,3 +431,154 @@ def test_private_ip_is_not_noise():
     # 对照组：回环与模拟器地址仍必须判为噪音
     assert ind.is_noise_url("http://127.0.0.1:8080/x") is True
     assert ind.is_noise_url("http://10.0.2.2:8080/x") is True
+
+
+@pytest.mark.parametrize("candidate", [
+    "https://api.sample.net:99999/api/login",
+    "https://api.sample.net:abc/api/login",
+    "https://-bad-.com/api/login",
+    "https://api..sample.net/api/login",
+    "https://api.sample.net/api/%ZZ",
+    "https://api.sample.net/api/{id}",
+])
+def test_make_indicator_rejects_invalid_url_syntax(candidate):
+    assert ind.make_indicator(candidate, "dex", "classes.dex") is None
+    assert list(ind._iter_urls(candidate)) == []
+
+
+def test_modern_country_tld_bare_host_is_extracted():
+    candidate = "backend.sample.uk/api/login"
+    assert list(ind._iter_urls(candidate)) == [candidate]
+
+
+def test_clean_url_preserves_semantic_trailing_characters():
+    for candidate in (
+        "https://api.sample.net/v1/",
+        "https://api.sample.net/a;",
+        "https://api.sample.net/a!",
+    ):
+        assert ind._clean_url(candidate) == candidate
+
+
+def test_config_concat_is_bound_by_variable_name():
+    text = (
+        'const baseUrl="https://one.sample.net"; '
+        'const apiUrl="https://two.sample.net"; '
+        'const x=baseUrl+"/api/a"; const y=apiUrl+"/v1/b";'
+    )
+    urls, endpoints = set(), set()
+    ind._harvest_config(text, urls, endpoints)
+    assert urls == {
+        "https://one.sample.net",
+        "https://one.sample.net/api/a",
+        "https://two.sample.net",
+        "https://two.sample.net/v1/b",
+    }
+
+
+def test_raw_binary_long_url_is_never_truncated():
+    candidate = "https://api.long-sample.net/api/" + "a" * 260
+    assert ind._scan_raw_for_urls(candidate.encode()) == {candidate}
+    too_long = "https://api.long-sample.net/api/" + "a" * 2200
+    assert ind._scan_raw_for_urls(too_long.encode()) == set()
+
+
+def test_noise_substring_requires_hostname_boundary():
+    assert ind.is_noise_url("https://notgithub.com/api/login") is False
+    assert ind.is_noise_url("https://myexample.com/api/login") is False
+
+
+# ---------------------------------------------------------------------------
+# 通联候选收口：源码后缀 / 无协议灰产 TLD / so 降权（2026-09-08）
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("token", [
+    "allocation.cc",
+    "HardwareEarMonitorDaisyJni.cc",
+    "androidmediadecoder.cc:183",
+    "Api.java",
+    "Rect.top",
+    "Filled.Cloud",
+    "QuicClient.cc:146",
+])
+def test_source_filename_is_not_a_network_candidate(token):
+    assert ind.is_syntax_valid_candidate(token) is False
+    assert ind.make_indicator(token, "native", "libx.so") is None
+    assert ind.url_rank(token) == "noise"
+
+
+def test_cargo_debug_path_is_not_a_network_candidate():
+    raw = (
+        "addr.rs/home/runner/.cargo/registry/src/index.crates.io-6f17d22bba15001f"
+        "/tokio-1.44.2/src/net/tcp/listener.rs"
+    )
+    assert ind.is_syntax_valid_candidate(raw) is False
+
+
+def test_gray_tld_without_scheme_is_not_biz():
+    assert ind.url_rank("yuliaotongxun.vip") == "weak"
+    assert ind.weak_worth_listing("yuliaotongxun.vip") is False
+
+
+def test_gray_tld_with_scheme_is_biz():
+    assert ind.url_rank("https://www.yuliaotongxun.vip") == "biz"
+    assert ind.url_rank("https://api.grayapp.shop") == "biz"
+
+
+def test_host_nonstandard_port_is_biz():
+    assert ind.url_rank("39.108.101.79:55007") == "biz"
+    assert ind.url_rank("admin.ekee.store:1883") == "biz"
+    i = ind.make_indicator("39.108.101.79:55007", "native", "libx.so")
+    assert i is not None
+    assert i["rank"] == "biz"
+
+
+def test_libcore_icu_and_xiaomi_shortlink_are_noise():
+    assert ind.url_rank("http://libcore.icu.icu") == "noise"
+    assert ind.url_rank("http://s.mi1.cc") == "noise"
+
+
+def test_native_scheme_less_gray_host_stays_weak():
+    i = ind.make_indicator("ap-prd-jd.grayapp.shop", "native", "libnertc.so")
+    assert i is not None
+    assert i["rank"] == "weak"
+
+
+def test_native_https_url_not_demoted():
+    i = ind.make_indicator("https://www.xmrhmy.icu", "native", "libx.so")
+    assert i is not None
+    assert i["rank"] == "biz"
+
+
+def test_js_property_port_is_not_biz():
+    assert ind.url_rank("i.length:16") != "biz"
+    assert ind.url_rank("xmp.did:50") != "biz"
+    assert ind.url_rank("t.audioBitrate:1") != "biz"
+    assert ind.weak_worth_listing("i.length:16") is False
+
+
+def test_api_prefix_gray_tld_without_scheme_is_biz():
+    assert ind.url_rank("api.3aksjgyg.shop") == "biz"
+    assert ind.url_rank("yuliaotongxun.vip") == "weak"
+
+
+def test_sdk_hosts_and_netcheck_are_noise():
+    assert ind.url_rank("https://edusuite-song.zego.im") == "noise"
+    assert ind.url_rank("https://commercial.kugou.com/v2/commercial/vip/info") == "noise"
+    assert ind.url_rank("https://lbs.netease.im/lbs/conf.jsp") == "noise"
+    assert ind.url_rank(
+        "https://api-access.pangolin-sdk-toutiao.com/v2/inspect/aegis/client/page/"
+    ) == "noise"
+    assert ind.url_rank(
+        "https://developer.mozilla.org/en-US/docs/Web/API/WakeLockSentinel/released"
+    ) == "noise"
+    assert ind.url_rank(
+        "https://cv-tob.bytedance.com/v1/api/sdk/tob_license/getlicense"
+    ) == "noise"
+    assert ind.url_rank("https://api.telegram.org/bot/sendMessage") == "noise"
+    assert ind.url_rank("3478stun.nextcloud.com:3478") == "noise"
+    assert ind.url_rank("https://162.14.10.42/netcheck") == "noise"
+
+
+def test_resources_arsc_path_is_not_a_network_candidate():
+    assert ind.is_syntax_valid_candidate("resources.arsc/AndroidManifest.xml") is False
+    assert ind.url_rank("resources.arsc/AndroidManifest.xml") == "noise"

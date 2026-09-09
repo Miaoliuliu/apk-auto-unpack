@@ -64,5 +64,7 @@ def execute(adapter: str, *, apk_path: str | None, package: str,
         raise RuntimeError("static_no_dump")
     if adapter in ("dpt-shell", "dpt"):
         from .flow_dpt_shell import dump as dpt_dump
-        return dpt_dump(package, out_dir, device=device, sleep=sleep or 20, kill=True)
+        # sleep=0 是合法值（尽快收尾），不能用 or 判空——会把 0 吞成默认 20
+        return dpt_dump(package, out_dir, device=device,
+                        sleep=20 if sleep is None else sleep, kill=True)
     raise RuntimeError(f"unsupported_adapter:{adapter}")

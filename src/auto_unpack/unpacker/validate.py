@@ -129,12 +129,18 @@ def _analyze_one_dumped_dex(dp: Path, items: list[dict], endpoints: set[str],
           f"{'' if payload else '  [stub/框架，不计入完整性、不提 URL]'}")
 
     if payload:
+        url_stats: dict = {}
         try:
-            inds, e = extract_indicators(str(dp))
+            inds, e = extract_indicators(str(dp), stats=url_stats)
             items.extend(inds)
             endpoints |= e
         except Exception as ex:
             print(f"      [警告] URL 提取失败: {ex}")
+            url_stats.setdefault("source_errors", []).append({
+                "source": "dumped_dex", "file": dp.name, "error": str(ex),
+            })
+    else:
+        url_stats = {}
 
     row = {
         "name": dp.name,
@@ -146,6 +152,7 @@ def _analyze_one_dumped_dex(dp: Path, items: list[dict], endpoints: set[str],
         "shell_ratio": ratio,
         "extraction": extraction,
         "payload": payload,
+        "url_extraction_stats": url_stats,
     }
     if stats.get("framework_ratio"):
         row["framework_ratio"] = round(float(stats["framework_ratio"]), 3)
@@ -165,13 +172,14 @@ def analyze_dumped_dexes(dexes: list[Path], apk_path: str | None
     endpoints: set[str] = set()
     items: list[dict] = []
     rows: list[dict] = []
+    apk_url_stats: dict = {}
 
     for dp in dexes:
         rows.append(_analyze_one_dumped_dex(dp, items, endpoints, dex_analyze, extract_indicators))
 
     if apk_path:
         try:
-            extra, ae = extract_apk_non_dex_sources(apk_path)
+            extra, ae = extract_apk_non_dex_sources(apk_path, stats=apk_url_stats)
             items.extend(extra)
             endpoints |= ae
             print(f"[*] APK 资源补 URL: {len(extra)} 个  端点: {len(ae)} 个")
@@ -179,6 +187,15 @@ def analyze_dumped_dexes(dexes: list[Path], apk_path: str | None
             print(f"[警告] APK 资源扫描失败: {ex}")
 
     quality = summarize_completeness(rows)
+    combined_url_stats: dict[str, list] = {}
+    for source_stats in [
+        *(row.get("url_extraction_stats") or {} for row in rows),
+        apk_url_stats,
+    ]:
+        for key, value in source_stats.items():
+            if isinstance(value, list) and value:
+                combined_url_stats.setdefault(key, []).extend(value)
+    quality["extraction_stats"] = combined_url_stats
     if quality["complete"]:
         print(f"[*] 方法体完整性: 通过（{quality['complete_note']}，"
               f"业务 dex {quality['payload_dex_count']} 个，跳过 stub "

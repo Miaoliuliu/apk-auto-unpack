@@ -12,9 +12,39 @@
 from __future__ import annotations
 
 import zipfile
+from pathlib import Path
 
 from auto_unpack.extraction.analyze import extract_apk_non_dex_sources
 from auto_unpack.unpacker.validate import analyze_dumped_dexes
+
+
+def test_parse_zip_dexes_does_not_read_whole_apk(monkeypatch, tmp_path: Path):
+    from auto_unpack.dex_utils import parse_dexes
+
+    apk = tmp_path / "empty.apk"
+    with zipfile.ZipFile(apk, "w") as zf:
+        zf.writestr("AndroidManifest.xml", b"manifest")
+
+    def fail_read_bytes(self):
+        raise AssertionError(f"unexpected whole-file read: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    assert parse_dexes(str(apk)) == []
+
+
+def test_parse_zip_dexes_blocks_extreme_compression_ratio(tmp_path: Path):
+    from auto_unpack.dex_utils import parse_dexes
+
+    apk = tmp_path / "bomb.apk"
+    with zipfile.ZipFile(apk, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("classes.dex", b"\0" * (1024 * 1024))
+
+    stats: dict = {}
+    assert parse_dexes(str(apk), stats=stats) == []
+    assert any(
+        row.get("reason") == "compression_ratio_exceeded"
+        for row in stats.get("source_skipped", [])
+    )
 
 
 def _hosts(items) -> set[str]:
@@ -41,7 +71,7 @@ def _build_apk(tmp_path):
 
 def test_non_dex_sources_covers_arsc_manifest_native_assets(tmp_path):
     apk = _build_apk(tmp_path)
-    items, endpoints = extract_apk_non_dex_sources(str(apk))
+    items, _endpoints = extract_apk_non_dex_sources(str(apk))
     hosts = _hosts(items)
     assert "arsc.unpacktest7.com" in hosts, f"arsc 来源缺失: {sorted(hosts)}"
     assert "mfest.unpacktest7.com" in hosts, f"manifest 来源缺失: {sorted(hosts)}"
@@ -52,8 +82,25 @@ def test_non_dex_sources_covers_arsc_manifest_native_assets(tmp_path):
 def test_analyze_dumped_dexes_wires_full_complement(tmp_path):
     """脱壳产物补扫已接入完整来源（空 dex 列表也走补扫）。"""
     apk = _build_apk(tmp_path)
-    endpoints, rows, quality, items = analyze_dumped_dexes([], str(apk))
+    _endpoints, _rows, _quality, items = analyze_dumped_dexes([], str(apk))
     hosts = _hosts(items)
     # 此前只有 assets + so 会被补到；arsc 是本次加固新增的覆盖来源
     assert "arsc.unpacktest7.com" in hosts, f"arsc 未补扫: {sorted(hosts)}"
     assert "mfest.unpacktest7.com" in hosts, f"manifest 未补扫: {sorted(hosts)}"
+
+
+def test_deep_coverage_does_not_depend_on_previous_url_hit(tmp_path):
+    apk = tmp_path / "coverage.apk"
+    with zipfile.ZipFile(apk, "w") as z:
+        z.writestr("assets/visible.txt", "https://api.visible-sample.net/api/seen")
+        z.writestr("assets/configblob", "https://api.hidden-sample.net/api/found")
+        z.writestr(
+            "assets/chunk-vendors.js",
+            "https://api.skipped-sample.net/api/found",
+        )
+    items, _ = extract_apk_non_dex_sources(str(apk))
+    assert _hosts(items) >= {
+        "api.visible-sample.net",
+        "api.hidden-sample.net",
+        "api.skipped-sample.net",
+    }

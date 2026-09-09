@@ -10,13 +10,18 @@ from __future__ import annotations
 import hashlib
 import struct
 import sys
-import zlib
 import zipfile
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from androguard.core.dex import DEX
+
+_MAX_DEX_BYTES = 256 * 1024 * 1024
+_MAX_TOTAL_DEX_BYTES = 512 * 1024 * 1024
+_MAX_DEX_COMPRESSION_RATIO = 200
+_MAX_DEX_ENTRIES = 1024
 
 # monkey patch：androguard 4.1.4 的 HiddenApiClassDataItem.DomapiApiFlag 只定义 0-2，
 # Android 13+ 的 dex 有 apiFlag=4/6 等新值，会抛 ValueError 导致整个 dex 解析失败
@@ -212,9 +217,18 @@ def _parse_zip_dexes(p: Path, stats: dict | None) -> list[tuple[str, "DEX"]]:
     fake_zip_encrypt: list[str] = []
     malformed_dex: list[str] = []
     parse_failed: list[tuple[str, str]] = []
+    total_dex_bytes = 0
     with zipfile.ZipFile(str(p)) as z:
         dex_names = [dn for dn in z.namelist() if dn.endswith(".dex")]
         dex_names.sort(key=lambda n: (Path(n).name != "classes.dex", n))
+        if len(dex_names) > _MAX_DEX_ENTRIES:
+            if stats is not None:
+                stats.setdefault("source_skipped", []).append({
+                    "source": "dex",
+                    "file": p.name,
+                    "reason": f"dex_entry_limit:{len(dex_names)}>{_MAX_DEX_ENTRIES}",
+                })
+            dex_names = dex_names[:_MAX_DEX_ENTRIES]
         for dn in dex_names:
             # 假 dex 诱饵（非 ASCII 路径，阿拉伯语乱码）：跳过不解析，大幅提速。
             # 实测黑产 APK 一个含几百个此类诱饵，逐个 DEX() 解析是全批扫描的瓶颈。
@@ -222,6 +236,27 @@ def _parse_zip_dexes(p: Path, stats: dict | None) -> list[tuple[str, "DEX"]]:
                 skipped += 1
                 continue
             info = z.getinfo(dn)
+            ratio = info.file_size / max(info.compress_size, 1)
+            if info.file_size > _MAX_DEX_BYTES:
+                if stats is not None:
+                    stats.setdefault("source_skipped", []).append({
+                        "source": "dex", "file": dn, "reason": "member_too_large",
+                    })
+                continue
+            if ratio > _MAX_DEX_COMPRESSION_RATIO:
+                if stats is not None:
+                    stats.setdefault("source_skipped", []).append({
+                        "source": "dex", "file": dn,
+                        "reason": "compression_ratio_exceeded",
+                    })
+                continue
+            if total_dex_bytes + info.file_size > _MAX_TOTAL_DEX_BYTES:
+                if stats is not None:
+                    stats.setdefault("source_skipped", []).append({
+                        "source": "dex", "file": dn, "reason": "byte_budget_exhausted",
+                    })
+                continue
+            total_dex_bytes += info.file_size
             raw, how = _read_zip_entry(z, info)
             if how == "fake_encrypt":
                 fake_zip_encrypt.append(dn)
@@ -269,9 +304,16 @@ def parse_dexes(path: str, *, stats: dict | None = None) -> list[tuple[str, "DEX
     malformed_dex / parse_failed。
     """
     p = Path(path)
-    data = p.read_bytes()
-    head = data[:4]
+    with p.open("rb") as fh:
+        head = fh.read(4)
     if head in (b"dex\n", b"dey\n"):
+        if p.stat().st_size > _MAX_DEX_BYTES:
+            if stats is not None:
+                stats.setdefault("source_skipped", []).append({
+                    "source": "dex", "file": p.name, "reason": "member_too_large",
+                })
+            return []
+        data = p.read_bytes()
         return _parse_bare_dex(data, p, stats)
     if not head.startswith(b"PK"):
         print(f"[警告] 不是 dex 也不是 zip，跳过: {p.name}", file=sys.stderr)

@@ -44,12 +44,24 @@ def _warn(msg: str) -> None:
 
 def _norm_path(p: str) -> str:
     """统一 ZIP 条目路径分隔符为 /（部分 zip 写反斜杠）。"""
-    return (p or "").replace("\\", "/")
+    raw = str(p or "").replace("\\", "/")
+    if not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw):
+        return ""
+    parts = raw.split("/")
+    if any(part in ("..", "") for part in parts[:-1]):
+        return ""
+    if any(part == ".." for part in parts):
+        return ""
+    return "/".join(part for part in parts if part != ".")
 
 
 def _basename(p: str) -> str:
     """取 ZIP 条目 basename（最后一个 / 之后），等价于 Path(p).name 但零分配。"""
-    return _norm_path(p).rsplit("/", 1)[-1]
+    raw = str(p or "").replace("\\", "/")
+    if (not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw)
+            or any(part == ".." for part in raw.split("/"))):
+        return ""
+    return raw.rstrip("/").rsplit("/", 1)[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +343,7 @@ def _find_fake_dex_decoys(view: _ApkView) -> list[str]:
         for name in candidates:
             magic = view.head(name, 8) or b""
             # 乱码路径本身只是启发式；真实 DEX 可能被故意改名，不能误报为诱饵。
-            if not (magic.startswith(b"dex\n") or magic.startswith(b"dey\n")):
+            if not magic.startswith((b"dex\n", b"dey\n")):
                 decoys.append(name)
     except Exception:
         # 无法读取内容时保留弱证据，避免静默丢失异常路径信息。
@@ -363,6 +375,11 @@ DPT_NATIVE_STRONG = (
     b"readAppComponentFactoryName",
     b"DPT_UNKNOWN_DATA",
 )
+# dpt 特有载荷路径字符串：native 读 assets 载荷时引用目录名，即使载荷改名，
+# 这些路径名仍会留在 so 内容里。dpt-shell 旧版壳 so 与爱加密同为 libexec*.so
+# （文件名特征冲突），so 内容命中这些独有路径名时按魔改 dpt 处理，
+# 不让爱加密抢走路由。爱加密 so 不含这两个字符串，不会反向误报。
+DPT_NATIVE_CONFLICT_STRINGS = (b"OoooooOooo", b"i11111i111")
 # bytehook 很多壳（Virbox / 爱加密 / 自研）都会链，不能当 dpt 独有特征。
 DPT_NATIVE_WEAK = (
     b"AppComponentFactory",
@@ -372,12 +389,20 @@ DPT_NATIVE_WEAK = (
     b"ProxyComponentFactory",
     b"bytehook-plt-trampolines",
 )
-DPT_APP_STUBS = (
-    "proxyapplication",
-    "proxycomponentfactory",
+DPT_APP_STUBS_STRONG = (
+    # 作者/组织名（dpt-shell 作者 luoyesiqiu），黑产之外的 app 不会出现。
     "nashsiqiu.shell",
     "luoyesiqiu",
 )
+DPT_APP_STUBS_WEAK = (
+    # ProxyApplication / ProxyComponentFactory 是 dpt-shell 默认类名，
+    # 但插件化/双开框架也大量使用同名类，单独命中不足以判 dpt，
+    # 需要 appComponentFactory 声明或根 dex stub 等壳行为佐证。
+    "proxyapplication",
+    "proxycomponentfactory",
+)
+# 兼容旧引用：全量 stub 子串
+DPT_APP_STUBS = DPT_APP_STUBS_STRONG + DPT_APP_STUBS_WEAK
 
 
 def _is_dpt_native(data: bytes) -> bool:
@@ -399,17 +424,28 @@ def _is_jdog_native_loader(data: bytes) -> bool:
     )
 
 
-def _dpt_app_stub(application: str | None) -> bool:
+def _dpt_app_stub_level(application: str | None) -> str:
+    """stub 类名命中等级：strong（作者名，dpt 独有）/ weak（默认类名，插件化也用）/ none。"""
     if not application:
-        return False
+        return "none"
     low = str(application).lower()
-    return any(m in low for m in DPT_APP_STUBS)
+    if any(m in low for m in DPT_APP_STUBS_STRONG):
+        return "strong"
+    if any(m in low for m in DPT_APP_STUBS_WEAK):
+        return "weak"
+    return "none"
+
+
+def _dpt_app_stub(application: str | None) -> bool:
+    return _dpt_app_stub_level(application) != "none"
 
 
 def _match_dpt_feature(path: str, feature: str) -> bool:
     """匹配 dpt 主文件，避免 i11111i111.zip.bak 这类前缀误报。"""
+    path = _norm_path(path).casefold()
+    feature = str(feature).casefold()
     prefix = "assets/" + feature
-    if feature in ("OoooooOooo", "vwwwwwvwww"):
+    if feature in ("oooooooooo", "vwwwwwvwww"):
         return path == prefix or path.startswith(prefix + "/")
     return path == prefix
 
@@ -427,25 +463,38 @@ def _appended_zip_in_dex_bytes(data: bytes) -> dict | None:
             return {"offset": off, "zip_len": zip_len, "endian": endian}
     if data.startswith(b"dex\n") and len(data) >= 40:
         declared = int.from_bytes(data[32:36], "little")
-        if (0x70 <= declared < len(data) - 8
-                and _valid_zip_slice(data, declared, len(data) - declared)):
-            return {
-                "offset": declared,
-                "zip_len": len(data) - declared,
-                "endian": "header",
-            }
+        if 0x70 <= declared < len(data) - 8:
+            entries = _zip_entries(data, declared, len(data) - declared)
+            # 普通 dex 尾部对齐 padding 后偶有合法 ZIP 结构（file_size < 实际长度），
+            # 不能仅凭"能打开"就判内嵌 ZIP。dpt 内嵌 ZIP 的条目就是壳特征文件
+            # （i11111i111.zip / OoooooOooo 等），或多条目载荷，二者其一才认定。
+            names = [n.lower() for n in entries]
+            if entries and (
+                len(entries) >= 2
+                or any(f.lower() in n for n in names for f in DPT_SHELL_FILES)
+            ):
+                return {
+                    "offset": declared,
+                    "zip_len": len(data) - declared,
+                    "endian": "header",
+                }
     return None
+
+
+def _zip_entries(data: bytes, offset: int, size: int) -> list[str]:
+    """读取候选切片的 ZIP 条目名；非合法 ZIP 或参数越界返回空。"""
+    if offset < 0 or size < 22 or offset + size > len(data):
+        return []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data[offset:offset + size])) as z:
+            return z.namelist()
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return []
 
 
 def _valid_zip_slice(data: bytes, offset: int, size: int) -> bool:
     """确认 dpt 尾部候选确实是 ZIP，而不是偶然出现的 PK 字节。"""
-    if offset < 0 or size < 22 or offset + size > len(data):
-        return False
-    try:
-        with zipfile.ZipFile(io.BytesIO(data[offset:offset + size])) as z:
-            return bool(z.namelist())
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return False
+    return bool(_zip_entries(data, offset, size))
 
 
 def _find_dpt_appended_zip(view: _ApkView) -> dict | None:
@@ -464,11 +513,9 @@ def _find_dpt_appended_zip(view: _ApkView) -> dict | None:
 def _find_hidden_dex(view: _ApkView) -> list[str]:
     """APKiD magic typing：assets 里文件名不是 .dex，但头是 dex\\n（藏真实 dex）。"""
     hits: list[str] = []
-    peeked = 0
+    candidates: list[zipfile.ZipInfo] = []
     try:
         for info in view.zf.infolist():
-            if peeked >= 24 or len(hits) >= 6:
-                break
             n = _norm_path(info.filename)
             low = n.lower()
             if not low.startswith("assets/"):
@@ -479,29 +526,43 @@ def _find_hidden_dex(view: _ApkView) -> list[str]:
                 continue
             if info.file_size < 4096:
                 continue
-            peeked += 1
+            candidates.append(info)
+        candidates.sort(key=lambda info: (-info.file_size, _norm_path(info.filename)))
+        scan_limit = min(len(candidates), _MAX_HIDDEN_DEX_CANDIDATES)
+        view.scan_stats["hidden_dex"] = {
+            "candidate_count": len(candidates),
+            "scanned_count": scan_limit,
+            "truncated": len(candidates) > scan_limit,
+        }
+        for info in candidates[:scan_limit]:
+            n = _norm_path(info.filename)
             magic = view.head(info, 36) or b""
             declared_size = int.from_bytes(magic[32:36], "little") if len(magic) >= 36 else 0
-            if ((magic.startswith(b"dex\n") or magic.startswith(b"dey\n"))
+            if (magic.startswith((b"dex\n", b"dey\n"))
                     and declared_size >= 0x70 and declared_size <= info.file_size):
                 hits.append(n)
+                if len(hits) >= 6:
+                    break
     except Exception:
-        return []
+        view.scan_stats.setdefault("hidden_dex", {})["truncated"] = True
     return hits
 
 
 def _scan_so_content(view: _ApkView, so_entries: list[str]) -> dict:
     """扫描 APK 内指定 so 条目的二进制内容（MobSF 思路，抓改名后的壳 so）。
 
-    返回 {non_elf, anti_strings, dpt_shell_so}
-      non_elf      = 非标准 ELF（可能被加密/自写格式的壳 so）
-      anti_strings = 内容含 frida/anti_debug 等反分析字符串的 so
-      dpt_shell_so = 命中 dpt-shell 系核心符号（readAppComponentFactoryName +
-                     AppComponentFactory）的 so —— 魔改版 dpt-shell 的特征
+    返回 {non_elf, anti_strings, dpt_shell_so, dpt_shell_so_weak, jdog_native_loader}
+      non_elf           = 非标准 ELF（可能被加密/自写格式的壳 so）
+      anti_strings      = 内容含 frida/anti_debug 等反分析字符串的 so
+      dpt_shell_so      = 命中 dpt-shell 系核心符号（readAppComponentFactoryName +
+                          AppComponentFactory）的 so —— 魔改版 dpt-shell 的特征
+      dpt_shell_so_weak = 命中 dpt 独有载荷路径名（OoooooOooo / i11111i111）的 so，
+                          用于 libexec*.so 与爱加密的文件名特征冲突复核
     """
     non_elf: list[str] = []
     anti: dict[str, list[str]] = {}
     dpt_shell_so: list[str] = []
+    dpt_shell_so_weak: list[str] = []
     jdog_native_loader: list[str] = []
     for entry in so_entries:
         try:
@@ -516,12 +577,15 @@ def _scan_so_content(view: _ApkView, so_entries: list[str]) -> dict:
             anti[entry] = hits
         if _is_dpt_native(data):
             dpt_shell_so.append(entry)
+        elif any(s in data for s in DPT_NATIVE_CONFLICT_STRINGS):
+            dpt_shell_so_weak.append(entry)
         if _is_jdog_native_loader(data):
             jdog_native_loader.append(entry)
     return {
         "non_elf": non_elf,
         "anti_strings": anti,
         "dpt_shell_so": dpt_shell_so,
+        "dpt_shell_so_weak": dpt_shell_so_weak,
         "jdog_native_loader": jdog_native_loader,
     }
 
@@ -573,6 +637,16 @@ _ASSET_PAYLOAD_SKIP_DIR = ("/www/", "/flutter_assets/", "/apps/", "/unicloud/")
 # ---------------------------------------------------------------------------
 # 特征提取
 # ---------------------------------------------------------------------------
+# _ApkView.read 的 zip 炸弹预算（与 dex_utils._parse_zip_dexes 的预算对齐）：
+# 识别是处理不可信输入的第一环，黑产对抗样本会用高压缩比/超大条目打 OOM。
+_MAX_VIEW_MEMBER_BYTES = 256 * 1024 * 1024
+_MAX_VIEW_COMPRESSION_RATIO = 200
+_MAX_VIEW_TOTAL_BYTES = 512 * 1024 * 1024
+_MAX_VIEW_READS = 4096
+_MAX_HIDDEN_DEX_CANDIDATES = 256
+_MAX_ASSET_PAYLOAD_CANDIDATES = 256
+
+
 class _ApkView:
     """APK 的单次打开视图：中心目录只解析一遍，跨检测阶段共享条目读取。
 
@@ -585,13 +659,45 @@ class _ApkView:
         self.path = path
         self.zf = zipfile.ZipFile(path)
         self.files: list[str] = self.zf.namelist()
+        self.read_bytes = 0
+        self.read_count = 0
+        self.budget_exhausted = False
+        self.scan_stats: dict[str, dict] = {}
+
+    @staticmethod
+    def _check_info(info: zipfile.ZipInfo, name: str) -> None:
+        if info.file_size > _MAX_VIEW_MEMBER_BYTES:
+            raise ValueError(
+                f"zip member too large: {name} ({info.file_size} bytes)")
+        ratio = info.file_size / max(info.compress_size, 1)
+        if ratio > _MAX_VIEW_COMPRESSION_RATIO:
+            raise ValueError(
+                f"zip member compression ratio exceeded: {name} ({ratio:.0f}:1)")
+
+    def _reserve(self, amount: int) -> None:
+        if self.read_count >= _MAX_VIEW_READS:
+            self.budget_exhausted = True
+            raise ValueError("APK ZIP read-count budget exhausted")
+        if self.read_bytes + amount > _MAX_VIEW_TOTAL_BYTES:
+            self.budget_exhausted = True
+            raise ValueError("APK ZIP decompressed-byte budget exhausted")
+        self.read_count += 1
+        self.read_bytes += max(0, amount)
 
     def read(self, name: str) -> bytes:
+        """读条目全量。zip 炸弹防护：条目过大或压缩比异常直接拒绝，
+        调用方（_scan_so_content / _detect_dpt_files 等）均有 try/except 兜底。"""
+        info = self.zf.getinfo(name)
+        self._check_info(info, name)
+        self._reserve(info.file_size)
         return self.zf.read(name)
 
     def head(self, name, n: int = 8) -> bytes | None:
         """读条目前 n 字节；name 可为文件名或 ZipInfo（同名重复条目时按 info 精确定位）。"""
         try:
+            info = name if isinstance(name, zipfile.ZipInfo) else self.zf.getinfo(name)
+            self._check_info(info, info.filename)
+            self._reserve(min(max(int(n), 0), info.file_size))
             with self.zf.open(name) as f:
                 return f.read(n)
         except Exception:
@@ -600,7 +706,7 @@ class _ApkView:
     def close(self) -> None:
         self.zf.close()
 
-    def __enter__(self) -> "_ApkView":
+    def __enter__(self) -> _ApkView:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -609,7 +715,7 @@ class _ApkView:
 
 def _find_asset_payloads(view: _ApkView, min_size: int = ASSET_PAYLOAD_MIN) -> list[str]:
     """assets/ 下超大块（加密 dex 等），排除 Uni-app www、Flutter、图片音视频。"""
-    hits: list[str] = []
+    candidates: list[zipfile.ZipInfo] = []
     for info in view.zf.infolist():
         if info.is_dir() or info.file_size < min_size:
             continue
@@ -621,10 +727,15 @@ def _find_asset_payloads(view: _ApkView, min_size: int = ASSET_PAYLOAD_MIN) -> l
             continue
         if low.endswith(_ASSET_PAYLOAD_SKIP_EXT):
             continue
-        hits.append(n)
-        if len(hits) >= 8:
-            break
-    return hits
+        candidates.append(info)
+    candidates.sort(key=lambda info: (-info.file_size, _norm_path(info.filename)))
+    scan_limit = min(len(candidates), _MAX_ASSET_PAYLOAD_CANDIDATES)
+    view.scan_stats["asset_payloads"] = {
+        "candidate_count": len(candidates),
+        "scanned_count": scan_limit,
+        "truncated": len(candidates) > scan_limit,
+    }
+    return [_norm_path(info.filename) for info in candidates[:scan_limit]]
 
 
 def _stub_like(dex_info: dict) -> bool:
@@ -711,10 +822,44 @@ def suggest_route(sig: dict) -> str:
         return "dpt"
     if sig.get("custom_family"):
         return "unknown"
-    if sig.get("matched"):
+    matched = sig.get("matched") or []
+    if sig.get("vendor_candidates") and not matched:
+        return "unknown"
+    scan_stats = sig.get("scan_stats") or {}
+    if any(isinstance(v, dict) and v.get("truncated")
+           for v in scan_stats.values()):
+        return "unknown"
+    keys = {m.get("key") for m in matched if m.get("key")}
+    if len(keys) > 1:
+        return "ambiguous"
+    apkid_packers = [str(p) for p in (sig.get("apkid_packers") or []) if p]
+    if apkid_packers:
+        try:
+            from .apkid import resolve_flows
+            apkid_flows = set(resolve_flows(apkid_packers))
+        except Exception:
+            apkid_flows = set()
+        if len(apkid_flows) > 1:
+            return "ambiguous"
+        static_flows = set()
+        if keys:
+            try:
+                from .apkid import resolve_flows
+                static_flows = set(resolve_flows(sorted(keys)))
+            except Exception:
+                static_flows = set()
+        if static_flows and apkid_flows and static_flows != apkid_flows:
+            return "ambiguous"
+        if len(apkid_flows) == 1:
+            return "vendor"
+        if not matched:
+            return "unknown"
+    if matched:
         return "vendor"
     if sig.get("dpt_shell"):
         return "dpt"
+    if sig.get("dex_status") in ("failed", "partial"):
+        return "unknown"
     if has_payload_dex(sig):
         return "static"
     if dex_unreadable(sig) or sig.get("dex_stub"):
@@ -729,15 +874,18 @@ def _collect_file_names(files) -> tuple[set[str], set[str], set[str]]:
     asset_names: set[str] = set()     # assets/ 下所有文件的 basename
     for f in files:
         f = _norm_path(f)
+        if not f:
+            continue
         # 注意：标准路径是 lib/arm64-v8a/xxx.so（无前导斜杠），必须同时匹配前缀和 "/lib/"
         # 曾用 "/lib/" in f 导致 lib/ 下的 so 全部漏掉（只匹配到 assets/ 下的）
-        if (f.startswith("lib/") or "/lib/" in f) and f.endswith(".so"):
+        low = f.casefold()
+        if (low.startswith("lib/") or "/lib/" in low) and low.endswith(".so"):
             lib_sos.add(_basename(f))
-        elif f.startswith("assets/") and f != "assets/":
+        elif low.startswith("assets/") and low != "assets/":
             base = _basename(f)
             if base:
                 asset_names.add(base)
-                if base.endswith(".so"):
+                if base.casefold().endswith(".so"):
                     asset_so_names.add(base)
     return lib_sos, asset_so_names, asset_names
 
@@ -764,22 +912,38 @@ def _read_manifest(view: _ApkView) -> tuple:
     return application, activities, manifest_error
 
 
+def _axml_string_present(manifest: bytes, value: str) -> bool:
+    """AXML 字符串池有 UTF-8 与 UTF-16LE 两种编码，属性名两种都要查。
+
+    灰产重打包工具生成的 manifest 常是 UTF-16LE 池（每字符后跟 \\x00），
+    只查 ASCII 字节会漏检 appComponentFactory，丢掉 dpt suspected 链的关键一环。
+    """
+    return value.encode("utf-8") in manifest or value.encode("utf-16-le") in manifest
+
+
 def _detect_dpt_files(files, view: _ApkView) -> tuple[list[str], bool]:
     """dpt-shell 特征文件 + appComponentFactory（raw AXML 字节检测，畸形 manifest 也能读）。"""
     # dpt-shell 特征文件检测（主数据目录允许子路径，文件名必须精确匹配）。
     dpt_shell_files: list[str] = []
     for f in files:
         n = _norm_path(f)
+        if not n:
+            continue
         for feat in DPT_SHELL_FILES:
             if _match_dpt_feature(n, feat) and feat not in dpt_shell_files:
                 dpt_shell_files.append(feat)
 
     # manifest 是否设置 appComponentFactory（dpt-shell 系壳特征，魔改版也保留）。
     has_appcomponentfactory = False
-    if "AndroidManifest.xml" in files:
+    manifest_name = next(
+        (f for f in files if _norm_path(f).casefold() == "androidmanifest.xml"),
+        None,
+    )
+    if manifest_name:
         try:
-            manifest_bytes = view.read("AndroidManifest.xml")
-            has_appcomponentfactory = b"appComponentFactory" in manifest_bytes
+            manifest_bytes = view.read(manifest_name)
+            has_appcomponentfactory = _axml_string_present(
+                manifest_bytes, "appComponentFactory")
         except Exception as e:
             _warn(f"manifest appComponentFactory 检测失败: {e}")
     return dpt_shell_files, has_appcomponentfactory
@@ -818,6 +982,7 @@ def extract_features(view: _ApkView) -> dict:
         "dpt_shell_files": sorted(dpt_shell_files),
         "appcomponentfactory": has_appcomponentfactory,
         "asset_payloads": asset_payloads,
+        "scan_stats": dict(view.scan_stats),
     }
 
 
@@ -975,46 +1140,108 @@ def analyze_dex_structure(path: str, light: bool = False, collect_names: bool = 
         result.append(_dex_row(name, d, light, class_names))
     encrypted_dex = list(parse_stats.get("encrypted_dex") or [])
     fake_zip_encrypt = list(parse_stats.get("fake_zip_encrypt") or [])
+    malformed_dex = list(parse_stats.get("malformed_dex") or [])
+    parse_failed = list(parse_stats.get("parse_failed") or [])
+    source_skipped = list(parse_stats.get("source_skipped") or [])
+    invalid_magic = int(parse_stats.get("invalid_magic") or 0)
+    skipped = int(parse_stats.get("skipped") or 0)
     total_classes = sum(r["classes"] for r in result)
     root_classes = next(
         (r["classes"] for r in result if _basename(r["name"]) == "classes.dex"),
         result[0]["classes"] if result else 0,
     )
-    stub = bool(result) and root_classes < STUB_CLASS_THRESHOLD \
+    small_dex = bool(result) and root_classes < STUB_CLASS_THRESHOLD \
         and total_classes < PAYLOAD_CLASS_THRESHOLD
     # ZIP 加密导致一个标准 dex 都解不出来：是对抗，不是无壳。
-    if not result and encrypted_dex:
-        stub = True
+    # Class count alone is only a weak hint: many valid APKs are small. Keep
+    # it as telemetry for DPT heuristics, while reserving ``stub`` for a
+    # stronger condition that the parsed DEX is encrypted/unavailable.
+    stub = bool(encrypted_dex)
+    problems = bool(
+        encrypted_dex or malformed_dex or parse_failed or source_skipped
+        or invalid_magic or skipped
+    )
+    if result and problems:
+        dex_status = "partial"
+    elif problems:
+        dex_status = "failed"
+    elif result:
+        dex_status = "ok"
+    else:
+        dex_status = "no_dex"
     return {
         "dex": result,
         "stub": stub,
+        "small_dex": small_dex,
         "class_names": class_names,
         "encrypted_dex": encrypted_dex,
         "fake_zip_encrypt": fake_zip_encrypt,
+        "malformed_dex": malformed_dex,
+        "parse_failed": parse_failed,
+        "source_skipped": source_skipped,
+        "invalid_magic": invalid_magic,
+        "skipped": skipped,
+        "dex_status": dex_status,
     }
 
 
 # ---------------------------------------------------------------------------
 # 对外接口
 # ---------------------------------------------------------------------------
-def _match_vendors(feats: dict) -> list[dict]:
-    """PACKERS 静态特征匹配：so / assets / stub 任一命中即认定该厂商。"""
-    matched: list[dict] = []
+_WEAK_VENDOR_FEATURES = {
+    ("ijiami", "so", "libexec*.so"),
+    ("oppo", "so", "liboppo*.so"),
+    ("legu", "stub", "stubshell"),
+    ("yidun", "stub", "protectt"),
+    ("bangcle", "stub", "applicationwrapper"),
+    ("ijiami", "stub", "ijiami"),
+}
+
+
+def _is_weak_vendor_hit(key: str, kind: str, value: str) -> bool:
+    value = value.casefold()
+    if key == "ijiami" and kind == "so":
+        return fnmatch.fnmatch(value, "libexec*.so")
+    if key == "oppo" and kind == "so":
+        return fnmatch.fnmatch(value, "liboppo*.so")
+    return (key, kind, value) in _WEAK_VENDOR_FEATURES
+
+
+def _match_vendor_candidates(feats: dict) -> list[dict]:
+    """Match signatures while retaining weak candidates for cross-checking."""
+    candidates: list[dict] = []
     for entry in PACKERS:
-        evidence = [
-            *(f"so:{x}" for x in _fnmatch_hits(
-                entry["so"], feats["lib_sos"] | feats["asset_so_names"])),
-            *(f"asset:{x}" for x in _fnmatch_hits(entry["assets"], feats["asset_names"])),
-            *(f"stub:{x}" for x in _match_stub(entry["stub"], feats["application"])),
-        ]
-        if evidence:
-            matched.append({
-                "vendor": entry["vendor"],
-                "key": entry["key"],
-                "generation": entry["generation"],
-                "evidence": evidence,
-            })
-    return matched
+        hits: list[tuple[str, str, str]] = []
+        for value in _fnmatch_hits(
+                entry["so"], feats["lib_sos"] | feats["asset_so_names"]):
+            hits.append(("so", value, value))
+        for value in _fnmatch_hits(entry["assets"], feats["asset_names"]):
+            hits.append(("asset", value, value))
+        for pattern in _match_stub(entry["stub"], feats["application"]):
+            hits.append(("stub", pattern, pattern))
+        if not hits:
+            continue
+        sources = {kind for kind, _, _ in hits}
+        weak_only = all(
+            _is_weak_vendor_hit(entry["key"], kind, value)
+            for kind, value, _ in hits
+        )
+        confirmed = not weak_only
+        candidates.append({
+            "vendor": entry["vendor"],
+            "key": entry["key"],
+            "generation": entry["generation"],
+            "evidence": [f"{kind}:{value}" for kind, value, _ in hits],
+            "confirmed": confirmed,
+            "evidence_strength": "weak" if weak_only else "strong",
+            "score": 0.35 if not confirmed else (0.75 if len(sources) == 1 else 0.9),
+        })
+    return candidates
+
+
+def _match_vendors(feats: dict) -> list[dict]:
+    """Return only vendor matches with sufficient independent evidence."""
+    return [m for m in _match_vendor_candidates(feats) if m["confirmed"]]
 
 
 _BANGCLE_ENT = (
@@ -1067,8 +1294,31 @@ def _decide_dpt_type(feats: dict, so_content: dict, appended_zip: dict | None,
         return True, "appended", [
             f"classes.dex内嵌ZIP@{appended_zip.get('offset')}",
         ]
-    if _dpt_app_stub(feats.get("application")):
+    if so_content.get("dpt_shell_so_weak"):
+        # libexec*.so 与爱加密文件名特征冲突：so 内容含 dpt 独有载荷路径名
+        # （OoooooOooo / i11111i111）→ 按魔改 dpt 处理，避免被爱加密路由抢走。
+        # modified（而非 suspected）：这些路径名是 dpt 工具链独有，可作强判定。
+        return True, "modified", [
+            *dict.fromkeys(
+                _basename(n) for n in (so_content.get("dpt_shell_so_weak") or [])
+            )
+        ]
+    stub_level = _dpt_app_stub_level(feats.get("application"))
+    if stub_level == "strong":
         return True, "modified", [f"stub:{feats.get('application')}"]
+    if stub_level == "weak" and (
+        feats.get("appcomponentfactory") or _stub_like(dex_info)
+    ):
+        # ProxyApplication / ProxyComponentFactory 是 dpt 默认类名，但插件化
+        # 框架同款；弱 stub 必须有壳行为佐证（appComponentFactory 声明 /
+        # 根 dex 是壳），且只给 suspected：如同时命中厂商特征，vendor 路由
+        # 优先（保守，宁可漏判 dpt 不误伤插件化业务包）。
+        evidence = [f"stub:{feats.get('application')}"]
+        if feats.get("appcomponentfactory"):
+            evidence.append("appComponentFactory")
+        if dex_info.get("stub"):
+            evidence.append("dex_stub")
+        return True, "suspected", evidence
     stub_like = _stub_like(dex_info)
     factory = bool(feats.get("appcomponentfactory"))
     if factory and stub_like and (asset_payloads or hidden_dex):
@@ -1089,8 +1339,10 @@ def _judge_dpt(signals: dict) -> tuple[bool, str | None, list[str], int]:
 
       标准版：assets 特征文件
       魔改版：native 符号（含 AWAKE 补充的 DPT_UNKNOWN_DATA / bytehook）
+              + libexec*.so 冲突复核（so 含 dpt 独有载荷路径名）
       内嵌 ZIP：classes.dex 尾部接 ZIP（dpt-unpack 机制，改名也在）
-      Java stub：ProxyApplication / nashsiqiu.shell
+      Java stub：强 stub（luoyesiqiu/nashsiqiu.shell）→ modified；
+                 弱 stub（ProxyApplication 等）+ 壳行为佐证 → suspected
       去符号疑似：factory + stub + assets 大块
     """
     feats = signals["feats"]
@@ -1236,7 +1488,11 @@ def _collect_dex_info(apk_path: str, feats: dict) -> tuple[dict, list[str]]:
     try:
         dex_info = analyze_dex_structure(apk_path, light=True, collect_names=True)
     except Exception as e:
-        dex_info = {"dex": [], "stub": False, "class_names": None}
+        dex_info = {
+            "dex": [], "stub": False, "class_names": None,
+            "dex_status": "failed",
+            "parse_failed": [(Path(apk_path).name, str(e))],
+        }
         _warn(f"dex 结构分析失败: {e}")
     # manifest 声明的 Application/Activity 不在任何 dex 里 → 真实 dex 被隐藏/运行时
     # 注入（frida-packing-detector 思路的静态反推）。仅作辅助证据。
@@ -1260,12 +1516,19 @@ def _collect_so_content(view: _ApkView, dpt_shell_files: list[str]) -> dict:
         "non_elf": [],
         "anti_strings": {},
         "dpt_shell_so": [],
+        "dpt_shell_so_weak": [],
         "jdog_native_loader": [],
     }
     try:
-        so_entries = [n for n in view.files
-                      if (n.startswith("lib/") or n.startswith("assets/")) and n.endswith(".so")]
-        if so_entries and not dpt_shell_files:
+        so_entries = []
+        for name in view.files:
+            normalized = _norm_path(name).casefold()
+            if (normalized.startswith(("lib/", "assets/"))
+                    and normalized.endswith(".so")):
+                so_entries.append(name)
+        # A weak DPT filename is not sufficient reason to skip native-content
+        # confirmation; doing so used to hide JDog loaders in the same APK.
+        if so_entries:
             so_content = _scan_so_content(view, so_entries)
     except Exception as e:
         _warn(f"so 内容扫描失败: {e}")
@@ -1289,7 +1552,8 @@ def _resolve_package(apk_path: str) -> tuple:
 
 
 def _compose_result(
-    matched: list[dict], qihoo_edition: str | None, qihoo_edition_evidence: list[str],
+    matched: list[dict], vendor_candidates: list[dict],
+    qihoo_edition: str | None, qihoo_edition_evidence: list[str],
     generation: int, feats: dict, file_sig: dict, dex_info: dict, so_content: dict,
     family: dict, hidden_dex: list, appended_zip: dict | None, manifest_missing: list[str],
     dpt_shell: bool, dpt_type: str | None, dpt_suspect_evidence: list[str],
@@ -1299,6 +1563,7 @@ def _compose_result(
     """组装 detect 结果 dict（PRD 报告合同的数据源）+ 派生 route。"""
     result = {
         "matched": matched,
+        "vendor_candidates": vendor_candidates,
         "edition": qihoo_edition,
         "edition_evidence": qihoo_edition_evidence,
         "vmp": file_sig["vmp"],
@@ -1318,6 +1583,7 @@ def _compose_result(
         "dpt_shell_files": file_sig["dpt_shell_files"],
         "dpt_primary_files": feats.get("dpt_primary_files", []),
         "dpt_shell_so": so_content.get("dpt_shell_so", []),
+        "dpt_shell_so_weak": so_content.get("dpt_shell_so_weak", []),
         "dpt_shell": dpt_shell,
         "dpt_type": dpt_type,
         "dpt_suspect_evidence": dpt_suspect_evidence,
@@ -1336,6 +1602,13 @@ def _compose_result(
         "runtime_dex_loader": bool(family["jdog_native_loader"]) or family["custom_family"] == "packhub_shell",
         "fake_dex_strong": family["fake_dex_strong"],
         "class_shortfall": shortfall,
+        "dex_status": dex_info.get("dex_status", "no_dex"),
+        "dex_parse_failed": dex_info.get("parse_failed", []),
+        "dex_malformed": dex_info.get("malformed_dex", []),
+        "dex_source_skipped": dex_info.get("source_skipped", []),
+        "dex_invalid_magic": dex_info.get("invalid_magic", 0),
+        "dex_skipped": dex_info.get("skipped", 0),
+        "scan_stats": feats.get("scan_stats", {}),
         "package": package,
         "package_source": package_source,
         "package_trusted": package_trusted,
@@ -1348,7 +1621,8 @@ def _compose_result(
 
 def _detect_apk(view: _ApkView, apk_path: str) -> dict:
     feats = extract_features(view)
-    matched = _match_vendors(feats)
+    vendor_candidates = _match_vendor_candidates(feats)
+    matched = [m for m in vendor_candidates if m["confirmed"]]
     generation = max((m["generation"] for m in matched), default=0)
     qihoo_edition, qihoo_edition_evidence = _tag_editions(matched, feats)
 
@@ -1357,6 +1631,13 @@ def _detect_apk(view: _ApkView, apk_path: str) -> dict:
     so_content = _collect_so_content(view, file_sig["dpt_shell_files"])
     hidden_dex = _find_hidden_dex(view)
     appended_zip = _find_dpt_appended_zip(view)
+    feats["scan_stats"] = dict(view.scan_stats)
+    feats["scan_stats"]["apk_view"] = {
+        "read_count": view.read_count,
+        "read_bytes": view.read_bytes,
+        "budget_exhausted": view.budget_exhausted,
+        "truncated": view.budget_exhausted,
+    }
 
     signals = {
         "feats": feats,
@@ -1388,7 +1669,8 @@ def _detect_apk(view: _ApkView, apk_path: str) -> dict:
     package, package_source, package_trusted, package_note = _resolve_package(apk_path)
 
     return _compose_result(
-        matched, qihoo_edition, qihoo_edition_evidence, generation,
+        matched, vendor_candidates,
+        qihoo_edition, qihoo_edition_evidence, generation,
         feats, file_sig, dex_info, so_content, family,
         hidden_dex, appended_zip, manifest_missing,
         dpt_shell, dpt_type, dpt_suspect_evidence,
