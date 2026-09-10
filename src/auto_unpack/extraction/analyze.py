@@ -67,9 +67,11 @@ _SKIP_ASSET_SUBSTR = (
 _SKIP_ASSET_NAMES = (
     "androidmanifest.xml", "public.xml", "ids.xml",
     "keyword.txt", "bad_domains.txt", "t-rex.html",
+    "geosite.dat", "geoip.dat", "geoip.metadb",
 )
 _SKIP_LIST_FILES = frozenset({
     "keyword.txt", "bad_domains.txt", "t-rex.html",
+    "geosite.dat", "geoip.dat", "geoip.metadb",
 })
 _MAX_ASSET_BYTES = 12 * 1024 * 1024
 # 全包二进制回扫：单文件上限（避免把超大 so/视频整读）
@@ -145,7 +147,12 @@ def _has_relevant_url(urls) -> bool:
 def _is_junk_list_file(base: str) -> bool:
     if base in _SKIP_LIST_FILES:
         return True
-    return "emoji" in base and base.endswith((".xml", ".json"))
+    if "emoji" in base and base.endswith((".xml", ".json")):
+        return True
+    # v2ray/xray 路由词表（coterie geosite.dat 一次灌 24 万裸域名）
+    return base.startswith(("geosite.", "geoip.")) and base.endswith(
+        (".dat", ".db", ".metadb")
+    )
 
 
 def _should_binary_scan_entry(name: str, size: int, deep: bool) -> bool:

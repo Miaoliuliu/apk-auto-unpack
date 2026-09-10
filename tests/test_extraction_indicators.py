@@ -374,7 +374,8 @@ def test_plausible_short_sld_allowed():
     assert ind._looks_plausible_url("http://jd.com") is True
     assert ind._looks_plausible_url("http://m.jd.com") is True
     assert ind.is_noise_url("https://jd.com/login") is False
-    assert ind.url_rank("https://jd.com/login") == "biz"
+    # /login 不再单独抬 biz；普通 .com 无 api. 前缀、无非常用端口 → weak
+    assert ind.url_rank("https://jd.com/login") == "weak"
 
 
 def test_plausible_single_char_still_rejected():
@@ -582,3 +583,142 @@ def test_sdk_hosts_and_netcheck_are_noise():
 def test_resources_arsc_path_is_not_a_network_candidate():
     assert ind.is_syntax_valid_candidate("resources.arsc/AndroidManifest.xml") is False
     assert ind.url_rank("resources.arsc/AndroidManifest.xml") == "noise"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-09：语法闸 + 通联形态（不再靠 /api/ 抬 biz、不再纯追 SDK 域名）
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("token", [
+    "com.android.art/lib/libart.so",
+    "com.termux/files/home",
+    "com.google.android.googlequicksearchbox/https/",
+    "vnd.android.cursor.dir/contact",
+    "dev.flutter/channel-buffers",
+])
+def test_android_path_is_not_a_network_locator(token):
+    assert ind.is_syntax_valid_candidate(token) is False
+    assert ind.make_indicator(token, "native", "libx.so") is None
+    assert ind.url_rank(token) == "noise"
+
+
+def test_generic_api_path_on_normal_domain_is_not_biz():
+    assert ind.url_rank("https://www.myservice.com/api/login") == "weak"
+    assert ind.url_rank("https://www.myservice.com/v2/ad") == "weak"
+    assert ind.url_rank("https://api.myservice.com/v1/login") == "biz"
+
+
+def test_infra_shapes_are_noise():
+    assert ind.url_rank("http://www.trustcenter.de/crl/v2/tc_class_2_ca_II.crl") == "noise"
+    assert ind.url_rank("https://1.12.12.12/dns-query") == "noise"
+    assert ind.url_rank("https://120.53.53.53/dns-query") == "noise"
+    assert ind.url_rank("http://ocsp.globalsign.com/rootr10") == "noise"
+    assert ind.url_rank("https://nls-log-gather.aliyuncs.com/api/gather") == "noise"
+    assert ind.url_rank("wss://nls-gateway-inner.aliyuncs.com:443/ws/v1") == "noise"
+
+
+def test_leftover_sdk_hosts_are_noise():
+    assert ind.url_rank("https://open.weibo.com/wiki/Android_SDK") == "noise"
+    assert ind.url_rank("https://apps.oceanengine.com/customer/api/app/pkg_info?") == "noise"
+    assert ind.url_rank("adservice.sigmob.cn/hb/v2/ad") == "noise"
+    assert ind.url_rank("https://metrics2.data.hicloud.com:6447") == "noise"
+    assert ind.url_rank("https://api.ip.sb/geoip") == "noise"
+
+
+def test_real_c2_still_biz_after_infra_filter():
+    assert ind.url_rank("https://api.botgate.cn") == "biz"
+    assert ind.url_rank("https://api.lmac.cc") == "biz"
+    assert ind.url_rank("39.108.101.79:55007") == "biz"
+    assert ind.url_rank("http://8.153.12.23:33926/okhttputil.php") == "biz"
+    assert ind.url_rank("https://www.yuliaotongxun.vip") == "biz"
+
+
+def test_go_len_prefix_github_is_noise():
+    assert ind.is_noise_url("0github.com/xtls/xray-core/proxy/shadowsocks_2022") is True
+    assert ind.url_rank("0github.com/xtls/xray-core/transport/internet/tls") == "noise"
+
+
+def test_binary_glue_trims_to_single_url():
+    glued = (
+        "http://login.t3f4wrg4s.top:81/AppInfo.aspx"
+        "?s=rustdesk.comenable-ipv6-punch/api/audit/Content-TypeWrong"
+    )
+    cleaned = ind._clean_url(glued)
+    assert cleaned.startswith("http://login.t3f4wrg4s.top:81/AppInfo.aspx")
+    assert "Content-Type" not in cleaned
+    assert "enable-ipv6-punch" not in cleaned
+    assert ind.is_syntax_valid_candidate(cleaned) is True
+    assert ind.url_rank(cleaned) == "biz"
+
+
+def test_paren_glue_is_trimmed():
+    raw = "https://socket.io/docs/v3/migrating-from-2-x-to-3-0/)VirtualizedList:"
+    cleaned = ind._clean_url(raw)
+    assert cleaned == "https://socket.io/docs/v3/migrating-from-2-x-to-3-0/"
+    assert ind.is_syntax_valid_candidate(cleaned) is True
+
+
+def test_sdk_source_file_is_noise_even_if_url_looks_biz():
+    item = ind.make_indicator(
+        "https://game.cailiao.im/v1/token",
+        "native",
+        "libliteavsdk.so",
+    )
+    assert item is not None
+    assert item["rank"] == "noise"
+
+
+def test_non_sdk_native_c2_not_demoted_by_source():
+    item = ind.make_indicator(
+        "39.108.101.79:55007",
+        "native",
+        "libcloudsend.so",
+    )
+    assert item is not None
+    assert item["rank"] == "biz"
+
+
+def test_syntax_valid_even_if_host_would_not_resolve():
+    """可达性不是语法闸：格式正确的死域名仍要提取。"""
+    raw = "https://api.this-host-should-not-exist-9f3c.shop/v1/login"
+    item = ind.make_indicator(raw, "dex", "classes.dex")
+    assert item is not None
+    assert item["validation"]["syntax"] == "valid"
+    assert item["validation"]["dns"] == "not_checked"
+    assert item["rank"] == "biz"
+    assert ind.is_syntax_valid_candidate(raw) is True
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-09：CIDR / JS IP 粘连 / geosite 词表
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("token", [
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "192.0.2.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "http://10.0.0.0/8",
+])
+def test_cidr_notation_is_not_a_network_locator(token):
+    assert ind.is_syntax_valid_candidate(token) is False
+    assert ind.make_indicator(token, "dex", "classes.dex") is None
+    assert ind.url_rank(token) == "noise"
+
+
+def test_ip_with_real_path_is_still_biz():
+    assert ind.url_rank("http://8.153.12.23:33926/okhttputil.php") == "biz"
+    assert ind.url_rank("https://192.168.31.38:8080/v1/token") == "biz"
+    assert ind.is_syntax_valid_candidate("http://43.132.55.55/d?dn=") is True
+
+
+@pytest.mark.parametrize("token", [
+    "1.2.3.4/i),a=null!==e.match(/ucweb/i),d=null!==e.match(/android/i)",
+    "1.2.3.4/i),i=",
+    "1.2.3.4/i",
+])
+def test_js_regex_ip_glue_is_not_a_locator(token):
+    assert ind.is_syntax_valid_candidate(token) is False
+    assert ind.make_indicator(token, "assets", "redfinger.min.js") is None
+    assert ind.url_rank(token) == "noise"

@@ -181,12 +181,102 @@ def _is_junk_network_token(raw: str) -> bool:
     return False
 
 
+# 包名 / Android authority：urlsplit 能解析，但不是网络定位符。
+_NOT_NETWORK_HOST_PREFIXES = (
+    "com.android.",
+    "com.google.android.",
+    "com.huawei.android.",
+    "com.hihonor.android.",
+    "com.termux.",
+    "androidx.",
+    "dev.flutter.",
+    "dev.fluttercommunity.",
+    "io.flutter.",
+    "vnd.android.",
+    "vnd.google.",
+)
+_UNIXISH_PATH_MARKERS = (
+    "/lib/", "/lib64/", "/usr/", "/files/", "/system/", "/data/",
+    "/proc/", "/apex/", "/vendor/",
+)
+_CERT_GLUE_RE = re.compile(r"\.(?:crl|pem|crt|der)[0-9a-z]", re.IGNORECASE)
+_SECOND_SCHEME_RE = re.compile(r"(?:https?|wss?)://", re.IGNORECASE)
+_QUERY_TLD_GLUE_RE = re.compile(
+    r"\.(?:com|net|org|io)[a-zA-Z]",
+    re.IGNORECASE,
+)
+_SDK_SOURCE_RE = re.compile(
+    r"(?i)(?:libzego|libliteav|libbugly|libimsdk|libbyteplus|"
+    r"zegoexpress|grs_sdk_)"
+)
+
+
+def _is_sdk_source_file(source_file: str) -> bool:
+    """已知广告/直播/统计 SDK 的 so/js/json，其中的 URL 不是样本通联。"""
+    name = source_basename(source_file)
+    return bool(name and _SDK_SOURCE_RE.search(name))
+
+
+_JS_REGEX_FLAGS_PATH_RE = re.compile(r"/[igmsuy]{1,6}$", re.IGNORECASE)
+
+
+def _is_cidr_notation(host: str, path: str, port) -> bool:
+    """IPv4/IPv6 + /前缀长度（10.0.0.0/8）是网段，不是 URL。带业务端口的不当 CIDR。"""
+    ip = _parse_ip(host)
+    if ip is None or port is not None:
+        return False
+    m = re.fullmatch(r"/(\d{1,3})", (path or "").split("?")[0])
+    if not m:
+        return False
+    n = int(m.group(1))
+    return 0 <= n <= (32 if ip.version == 4 else 128)
+
+
+def _is_well_formed_locator(raw: str, parsed) -> bool:
+    """语法闸：必须是单独一条 HTTP/WS URL 或 host[:port][/path]，不管是否可达。"""
+    parts, scheme, host, port = parsed
+    path = parts.path or ""
+    low_host = (host or "").lower()
+    if not low_host:
+        return False
+    if low_host.startswith("vnd."):
+        return False
+    if any(low_host == p.rstrip(".") or low_host.startswith(p)
+           for p in _NOT_NETWORK_HOST_PREFIXES):
+        return False
+    path_l = path.lower()
+    if not scheme:
+        if any(m in path_l for m in _UNIXISH_PATH_MARKERS):
+            return False
+        if path_l.endswith((".so", ".a", ".o", ".jar", ".dex")):
+            return False
+        if path_l.startswith(("/com.", "/android.", "/kotlin.")):
+            return False
+    if _parse_ip(host) is not None:
+        if _is_cidr_notation(host, path, port):
+            return False
+        if any(ch in path for ch in "(),"):
+            return False
+        if _JS_REGEX_FLAGS_PATH_RE.fullmatch((path or "").split("?")[0]):
+            return False
+    if re.search(r"\)[A-Za-z_]", raw):
+        return False
+    if re.search(r"Content-Type", raw, re.I) and "content-type=" not in raw.lower():
+        return False
+    if path_l and _CERT_GLUE_RE.search(path_l):
+        return False
+    return True
+
+
 def is_syntax_valid_candidate(raw: str) -> bool:
-    """是否为合法 HTTP/WS URL 或无协议网络主机指标。"""
+    """是否为合法 HTTP/WS URL 或无协议网络主机指标。可达性不在此判定。"""
     value = (raw or "").strip().strip("\x00")
     if len(value) < 4 or _is_junk_network_token(value):
         return False
-    return _split_candidate(value) is not None
+    parsed = _split_candidate(value)
+    if parsed is None:
+        return False
+    return _is_well_formed_locator(value, parsed)
 
 
 def _canonical_candidate(raw: str, parsed) -> tuple[str, str, str, int | None, str]:
@@ -217,7 +307,7 @@ def make_indicator(url: str, source_type: str, source_file: str,
     if _is_junk_network_token(raw):
         return None
     parsed = _split_candidate(raw)
-    if parsed is None:
+    if parsed is None or not _is_well_formed_locator(raw, parsed):
         return None
     canonical, scheme, host, port, path = _canonical_candidate(raw, parsed)
     kind = classify_type(raw, host, path)
@@ -227,6 +317,8 @@ def make_indicator(url: str, source_type: str, source_file: str,
         if not (port and port not in (80, 443, 53, 853)):
             if rank == "biz":
                 rank = "weak"
+    if _is_sdk_source_file(source_file) and rank != "noise":
+        rank = "noise"
     return {
         "value": raw,
         "observed_value": raw,
@@ -535,6 +627,12 @@ _NOISE_HOST_ROOTS = (
     "pangolin-sdk-toutiao.com", "pangolin-sdk-toutiao-b.com",
     "mozilla.org", "bytedance.com",
     "telegram.org", "nextcloud.com",
+    # 2026-09-09：公共基础设施用形态过滤；下列是普通 .com 漏网
+    "weibo.com", "oceanengine.com", "sigmob.cn",
+    "hicloud.com", "dbankcloud.ru", "dbankcloud.com",
+    "cmpassport.com", "rustdesk.com", "curl.se", "docs.rs",
+    "dartbug.com", "zegocloud.com", "flutter.io",
+    "ip.sb", "ipify.org", "seeip.org",
 )
 # 公共 DNS / 模拟器：端口常不是 80/443，旧规则会误抬成 biz
 _PUBLIC_DNS_IPS = frozenset({
@@ -545,6 +643,7 @@ _PUBLIC_DNS_IPS = frozenset({
     "114.114.114.114", "114.114.115.115",
     "119.29.29.29", "119.28.28.28",
     "180.76.76.76", "168.95.1.1",
+    "1.12.12.12", "120.53.53.53",
 })
 _PUBLIC_DNS_V6 = frozenset({
     ipaddress.IPv6Address("2001:4860:4860::8888"),
@@ -704,6 +803,39 @@ def _looks_code_host(host: str) -> bool:
     return any(lab in _CODE_HOST_LABELS for lab in labels[:-1])
 
 
+def _host_variants_for_noise(host: str) -> list[str]:
+    """Go 串池长度前缀：0github.com / 0google.golang.org 归一到真实 host。"""
+    host = (host or "").lower()
+    out = [host]
+    m = re.match(r"^(\d{1,4})([a-z][a-z0-9\-]*\..+)$", host)
+    if m:
+        out.append(m.group(2))
+    return out
+
+
+def _host_matches_root(host: str, root: str) -> bool:
+    root = (root or "").lower()
+    return any(h == root or h.endswith("." + root) for h in _host_variants_for_noise(host))
+
+
+def _is_infra_shape(host: str, path: str) -> bool:
+    """证书 / DoH / 阿里云 NLS：按形态过滤，不靠域名追名单。"""
+    path_l = (path or "").split("?")[0].lower().rstrip("/")
+    host_l = (host or "").lower()
+    if path_l.endswith("/dns-query") or path_l == "dns-query":
+        return True
+    if path_l.endswith(".crl") or "/crl/" in (path or "").lower():
+        return True
+    if "/ocsp" in (path or "").lower():
+        return True
+    first = host_l.split(".")[0]
+    if first in ("ocsp", "crl"):
+        return True
+    if host_l.endswith(".aliyuncs.com") and re.search(r"(^|\.)nls[-.]", host_l):
+        return True
+    return False
+
+
 def is_noise_url(u: str) -> bool:
     """框架文档、系统 schema、SDK 埋点等，不是样本业务后端。"""
     u = (u or "").strip().strip("\x00")
@@ -722,13 +854,17 @@ def is_noise_url(u: str) -> bool:
     # 域名规则按 host 边界匹配；带路径/普通关键词的规则才做子串匹配。
     # 避免 query 里嵌套的外部 URL（?u=https://github.com/...）整条被误杀
     no_q = low.split("?", 1)[0].split("#", 1)[0]
-    if any(
-        (n in no_q if "/" in n or "." not in n else host == n or host.endswith("." + n))
-        for n in _NOISE_SUBSTR
-    ):
-        return True
+    for n in _NOISE_SUBSTR:
+        if "/" in n or "." not in n:
+            if n in no_q:
+                return True
+            continue
+        if _host_matches_root(host, n):
+            return True
     port, path = _url_port_and_path(u)
     if (path or "").split("?")[0].rstrip("/").endswith("/netcheck"):
+        return True
+    if _is_infra_shape(host, path):
         return True
     ip = _parse_ip(host)
     if ip is not None:
@@ -751,7 +887,7 @@ def is_noise_url(u: str) -> bool:
         return True
     if _looks_code_host(host):
         return True
-    if any(host == root or host.endswith("." + root) for root in _NOISE_HOST_ROOTS):
+    if any(_host_matches_root(host, root) for root in _NOISE_HOST_ROOTS):
         return True
     # XML namespace / SAX feature 形态
     if any(p in low for p in ("/xml/features", "/sax/features", "/sax/properties",
@@ -761,11 +897,6 @@ def is_noise_url(u: str) -> bool:
     return not _looks_plausible_url(check)
 
 
-_BIZ_PATH_HINTS = (
-    "/index.php/", "/api.php/", "/home/", "/api/", "/v1/", "/v2/",
-    "/user/", "/login", "/upload", "/ios", "/android", "/bot/",
-    "/release", "/gateway", "/im/", "/socket",
-)
 _GRAY_TLD_HOST_RE = re.compile(r"\." + _GRAY_TLD + r"$", re.IGNORECASE)
 
 
@@ -786,23 +917,27 @@ def _host_ok_for_unusual_port(host: str) -> bool:
 
 
 def url_rank(u: str) -> str:
-    """noise = 框架/文档；weak = 像 URL 但无业务信号；biz = 灰产后端。"""
+    """通联分级（字符串层）：noise=公共基础设施，biz=样本业务后端，weak=像 URL 但证据不足。
+
+    不再用 /api/、/v2/、/login 单独抬 biz（广告/云 SDK 同样带这些路径）。
+    可达性不参与分级。
+    """
     u = (u or "").strip().strip("\x00")
     if not u or _is_junk_network_token(u) or is_noise_url(u):
+        return "noise"
+    parsed = _split_candidate(u)
+    if parsed is None or not _is_well_formed_locator(u, parsed):
         return "noise"
     host = _host_of(u)
     low = u.lower()
     port, path = _url_port_and_path(u)
     path_only = (path or "").split("?")[0]
     has_scheme = bool(_SCHEME_PREFIX_RE.match(u))
-    has_biz_path = (
-        any(h in low for h in _BIZ_PATH_HINTS)
-        or ".php" in path_only.lower()
-    )
+    has_php = ".php" in path_only.lower()
     first = (host or "").split(".")[0]
     if _parse_ip(host or "") is not None:
-        # 裸 IP:80/443 无路径多半是 CDN/证书探测；真正 C2 常带路径或非常用端口
-        if has_biz_path or path_only not in ("", "/"):
+        # 硬编码 IP 带路径或非常用端口，视为通联；80/443 裸 IP 证据不足
+        if has_php or path_only not in ("", "/"):
             return "biz"
         if port and port not in (80, 443):
             return "biz"
@@ -815,7 +950,7 @@ def url_rank(u: str) -> str:
     if host and _GRAY_TLD_HOST_RE.search(host):
         if has_scheme or first in ("api", "apis"):
             return "biz"
-    if has_biz_path:
+    if has_php:
         return "biz"
     if has_scheme and first in ("api", "apis", "gateway", "gw"):
         return "biz"
@@ -850,7 +985,7 @@ def weak_worth_listing(u: str) -> bool:
 
 
 def business_urls(urls: set[str]) -> set[str]:
-    """只保留有业务信号的 URL（灰产 TLD / 内网 IP / php·api 路径 / ws）。"""
+    """只保留通联（灰产 TLD / 硬编码 IP / .php / api. 主机 / ws）。"""
     return {u.strip("\x00") for u in urls if u and url_rank(u) == "biz"}
 
 # ---------------------------------------------------------------------------
@@ -880,6 +1015,32 @@ def _clean_url(s: str) -> str:
         s = s[:-1]
     while s.endswith("]") and s.count("]") > s.count("["):
         s = s[:-1]
+    return _trim_binary_glue(s)
+
+
+def _trim_binary_glue(s: str) -> str:
+    """二进制扫描常把下一条字符串粘在 URL 后面；截成单独一条，保留前缀通联。"""
+    schemes = list(_SECOND_SCHEME_RE.finditer(s))
+    if len(schemes) >= 2:
+        for m in schemes[1:]:
+            prev = s[m.start() - 1] if m.start() else ""
+            if prev in "=&#":
+                continue
+            s = s[:m.start()]
+            break
+    m = re.search(r"\)[A-Za-z_]", s)
+    if m:
+        s = s[:m.start()]
+        while s.endswith(")") and s.count(")") > s.count("("):
+            s = s[:-1]
+    m = re.search(r"Content-Type", s, re.I)
+    if m and "content-type=" not in s.lower():
+        s = s[:m.start()].rstrip("/?&=;._-")
+    if "?" in s:
+        pre, query = s.split("?", 1)
+        qm = _QUERY_TLD_GLUE_RE.search(query)
+        if qm:
+            s = pre + "?" + query[:qm.end() - 1]
     return s
 
 

@@ -287,7 +287,11 @@ def test_skip_junk_list_assets_and_binary():
     assert _skip_asset("assets/t-rex.html") is True
     assert _skip_asset("assets/emoji.xml") is True
     assert _skip_asset("assets/www/config.json") is False
+    assert _skip_asset("assets/geosite.dat") is True
+    assert _skip_asset("assets/geoip.dat") is True
+    assert _skip_asset("assets/geosite.v2.dat") is True
     assert _should_binary_scan_entry("assets/keyword.txt", 4096, True) is False
+    assert _should_binary_scan_entry("assets/geosite.dat", 4096, True) is False
     assert _should_binary_scan_entry("AndroidManifest.xml", 4096, False) is True
 
 
