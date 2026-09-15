@@ -7,19 +7,21 @@
 
 自动完成（无需任何命令行参数）：
     识别壳 → dpt-shell 自动 frida 脱壳 → 提取 URL
+           → 360 / 乐固 / 易盾 frida-dexdump -f -d 深度脱壳 → 提取 URL
            → 无壳直接静态提取 URL
-           → 厂商壳 / 自研保护 / VMP 转人工（不抽 URL）
+           → 其余厂商壳 / 自研保护 / 360付费版 / VMP 转人工（不抽 URL）
 
 产物（自动落在 outputs/ 下）：
     outputs/packer_detection/<壳名>/      壳识别归档
     outputs/extracted_urls/<apk名>/       URL 清单（urls_by_rank.txt）
-    outputs/unpacked_dex/<apk名>/         脱壳 dex（仅 dpt-shell 脱壳成功时）
+    outputs/unpacked_dex/<apk名>/         脱壳 dex（dpt / 360 / 乐固 / 易盾成功时）
 
 运行前提：
     1. PyCharm 解释器选「系统 Python 3.10」：C:/Program Files/Python310/python.exe
        （这是唯一同时装了 frida + androguard + auto_unpack 的环境）
     2. 真机 USB 连着（adb devices 能看到设备）
-    3. dpt 脱壳需要 frida-server 以 root 运行，否则 dpt 样本会自动转人工（不影响无壳样本）
+    3. 动态脱壳需要 frida-server 以 root 运行；360 / 乐固 / 易盾还需要已安装 frida-dexdump
+       （系统 Python 3.10 已装即可）。否则这些样本会转人工，不影响无壳样本。
 """
 
 import os
@@ -37,7 +39,7 @@ if str(_SRC) not in sys.path:
 
 # 3) 内嵌配置 —— 全部参数都在这里，无需命令行、无需手动调参
 CONFIG = {
-    "unpack": True,             # True = 有壳自动脱壳（dpt-shell）
+    "unpack": True,             # True = 有壳自动脱壳（dpt-shell / 360 / 乐固 / 易盾）
     "install": "when_needed",   # never / when_needed / always：脱壳前是否 adb install
     "skip_apkid": False,        # False = 跑 APKiD 补强（需能联网 / 已开代理）
     "recursive": False,         # True = 递归读 APK/ 子目录
@@ -69,10 +71,17 @@ def _preflight() -> None:
         import frida
         print(f"  frida      : {frida.__version__}（可动态脱壳）")
     except Exception:
-        print("  frida      : 未安装 → dpt 脱壳不可用，会自动转人工。"
+        print("  frida      : 未安装 → dpt/360/乐固/易盾脱壳不可用，会自动转人工。"
               "请把 PyCharm 解释器切到系统 Python 3.10")
 
     import shutil
+    _dexdump = shutil.which("frida-dexdump")
+    if not _dexdump:
+        _cand = Path(sys.executable).parent / "Scripts" / "frida-dexdump.exe"
+        if _cand.is_file():
+            _dexdump = str(_cand)
+    print("  dexdump    : " + (_dexdump or "未找到（360/乐固/易盾脱壳需要 frida-dexdump）"))
+
     print("  adb        : " + ("已找到" if shutil.which("adb") else "未找到（脱壳/装包需要 adb）"))
     print("=" * 64)
 

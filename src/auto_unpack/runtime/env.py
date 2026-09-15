@@ -6,7 +6,7 @@
     {
       "device": null,           // 空 = USB 第一台；多设备时填 adb/frida 设备 ID
       "install": "when_needed", // never | when_needed | always
-      "sleep": 20,              // spawn 后最多等待秒数
+      "sleep": 10,              // spawn 后等待秒数（360：等主页面加载再 dump）
       "unpack": false,          // 默认不动态执行 APK；要脱壳需 --unpack
       "uninstall": true,        // 脱壳完成后卸载本次 adb install 装的 app（设备原有的不动）
       "timeout": 300            // 有壳分析超时秒数
@@ -53,7 +53,7 @@ INSTALL_MODES = (INSTALL_NEVER, INSTALL_WHEN_NEEDED, INSTALL_ALWAYS)
 DEFAULTS: dict = {
     "device": None,
     "install": INSTALL_WHEN_NEEDED,
-    "sleep": 20,
+    "sleep": 10,
     "unpack": False,
     "uninstall": True,
     "timeout": 300,

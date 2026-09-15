@@ -22,7 +22,8 @@ import sys
 from pathlib import Path
 
 from ..extraction.report import failed_report, packed_flag, packer_label
-from ..packer.packer_sigs import dex_unreadable, has_payload_dex
+from ..packer.packer_sigs import decide_packer, dex_unreadable, has_payload_dex
+from ..unpacker.adapters import AUTOMATIC_ADAPTERS
 from ..unpacker.adapters import execute as adapter_execute
 from ..unpacker.adapters import select_adapter
 from ..unpacker.validate import analyze_dumped_dexes, warn_extraction
@@ -62,27 +63,15 @@ def _tool_versions() -> dict:
 
 
 def _packer_confidence(sig: dict) -> tuple[str, float]:
-    if sig.get("vmp"):
-        return "high", 0.9
-    if sig.get("custom_family") == "jdog_native_dex_loader":
-        return "high", 0.93
-    if sig.get("custom_family") == "packhub_shell":
-        return "high", 0.9
-    kind = sig.get("dpt_type")
-    if kind == "standard":
-        return "high", 0.95
-    if kind in ("modified", "appended"):
-        return "high", 0.88
-    if kind == "suspected":
-        return "low", 0.45
-    matched = sig.get("matched") or []
-    if len(matched) > 1:
-        return "medium", 0.7
-    if matched:
-        return "high", 0.9
-    if sig.get("custom_packer") or sig.get("dex_stub"):
-        return "medium", 0.55
-    return "low", 0.2
+    decision = decide_packer(sig)
+    score = float(decision.get("score") or 0)
+    if score >= 0.85:
+        return "high", score
+    if score >= 0.65:
+        return "high", score
+    if score >= 0.45:
+        return "medium", score
+    return "low", score
 
 
 def _packer_status(route: str, sig: dict) -> str:
@@ -94,7 +83,8 @@ def _packer_status(route: str, sig: dict) -> str:
         return "AMBIGUOUS"
     if sig.get("vmp"):
         return "PACKER_IDENTIFIED"
-    if sig.get("dpt_type") == "suspected":
+    # suspected dpt 只是旁路假设；主壳已经是确认厂商时不能一票否决成 packed=unknown
+    if route == "dpt" and sig.get("dpt_type") == "suspected":
         return "PACKER_SUSPECTED"
     matched = sig.get("matched") or []
     if len(matched) > 1 and not sig.get("dpt_shell"):
@@ -105,19 +95,11 @@ def _packer_status(route: str, sig: dict) -> str:
 
 
 def _packer_name(sig: dict) -> str | None:
-    matched = sig.get("matched") or []
-    vendor = "+".join(m.get("vendor") or m.get("key") or "?" for m in matched) if matched else None
-    if sig.get("vmp"):
-        return f"{vendor}(VMP)" if vendor else "VMP/Dex2C"
-    if sig.get("dpt_shell"):
-        return "dpt-shell"
-    if sig.get("custom_family") in ("jdog_native_dex_loader", "packhub_shell"):
-        return "自研保护"
-    if vendor:
-        return vendor
-    if dex_unreadable(sig) or sig.get("dex_stub") or sig.get("custom_family"):
-        return "自研保护"
-    return None
+    """对外壳名：与 decide_packer 同一套分数比较，不再另写一条 if 链。"""
+    decision = decide_packer(sig)
+    if decision.get("route") == "static":
+        return None
+    return decision.get("name")
 
 
 def _evidence(sig: dict) -> list[str]:
@@ -527,7 +509,7 @@ def _stage_route(task: Task, sig: dict, *, device: str | None,
     adapter = select_adapter(
         task.route, sig, task.packer.get("apkid", {}).get("packers") or [])
     task.packer["adapter"] = adapter
-    task.packer["automatic_unpack"] = adapter in ("dpt-shell", "dpt")
+    task.packer["automatic_unpack"] = adapter in AUTOMATIC_ADAPTERS
     if task.route == "vendor" and adapter == "unsupported":
         task.packer["automatic_unpack"] = False
         task.packer["support_status"] = "unsupported_packer"

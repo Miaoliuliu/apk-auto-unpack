@@ -38,8 +38,8 @@ def find_apkid() -> str:
 
 
 # 静态/APKiD packer key → 厂商脱壳插件（与 packer_sigs.PACKERS 的 key 对齐）。
-# 目前只有 flow_dpt_shell 真正实现了动态 dump；其余插件命中只用于把路由
-# 定成 vendor（→ unsupported，静态提取），不会被执行。顺序即匹配优先级。
+# 已实现动态 dump：flow_dpt_shell、flow_360、flow_legu、flow_netease。
+# 其余插件命中只把路由定成 vendor（→ unsupported），不会被执行。顺序即匹配优先级。
 UNPACK_FLOWS: dict[str, tuple[str, ...]] = {
     "unpacker/flow_360.py": ("360", "qihoo", "jiagu"),
     "unpacker/flow_legu.py": ("legu", "tencent"),
@@ -58,6 +58,9 @@ UNPACK_FLOWS: dict[str, tuple[str, ...]] = {
 }
 IMPLEMENTED_FLOWS = {
     "unpacker/flow_dpt_shell.py": "dpt-shell",
+    "unpacker/flow_360.py": "360",
+    "unpacker/flow_legu.py": "legu",
+    "unpacker/flow_netease.py": "yidun",
 }
 
 
@@ -236,6 +239,9 @@ def _canonical_apkid_key(name: str) -> str | None:
     low = re.sub(r"[^a-z0-9+]+", " ", str(name).casefold()).strip()
     if not low:
         return None
+    known_keys = set(_APKiD_ALIASES.values())
+    if low in known_keys:
+        return low
     for alias, key in _APKiD_ALIASES.items():
         alias_low = alias.casefold()
         if low == alias_low or alias_low in low.split():

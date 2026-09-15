@@ -5,7 +5,7 @@
 
 断言值来源：
   - 真实样本实测（packer_detection/ 归档库 + APKiD 交叉验证结论）
-  - 源码判定链逐分支推导（suggest_route 短路顺序）
+  - 源码判定链：decide_packer 对假设打分后取最高分
 
 不依赖 androguard（dex_utils 顶层仅 stdlib），离线可跑：
     C:/Users/Administrator/.workbuddy/binaries/python/envs/default/Scripts/python.exe -m pytest tests/ -v
@@ -19,7 +19,7 @@ from auto_unpack.packer import packer_sigs as ps
 
 
 # ---------------------------------------------------------------------------
-# suggest_route：分流决策链（短路顺序：paid/vmp → manual → dpt → unknown → vendor → static）
+# suggest_route：decide_packer 按证据分数选主壳
 # ---------------------------------------------------------------------------
 def test_route_manual_when_paid_edition():
     sig = {"edition": "paid", "vmp": False, "dpt_shell": False,
@@ -66,11 +66,91 @@ def test_route_dpt_suspected():
 
 
 def test_route_unknown_custom_family():
-    """JDog/packhub 自研保护：优先于厂商特征，转人工。"""
+    """仅有 JDog/packhub、没有确认厂商身份：转人工。"""
     sig = {"edition": None, "vmp": False, "dpt_shell": False,
            "dpt_type": None, "custom_family": "jdog_native_dex_loader",
            "matched": [], "dex_stub": False, "dex_classes": [2000]}
     assert ps.suggest_route(sig) == "unknown"
+
+
+def test_route_confirmed_vendor_outranks_custom_family():
+    """360 特征文件分高于 JDog 加载器分，主壳是 360；JDog 假设仍保留。"""
+    sig = {
+        "edition": "standard", "vmp": False, "dpt_shell": False,
+        "dpt_type": None, "custom_family": "jdog_native_dex_loader",
+        "matched": [{
+            "vendor": "360加固", "key": "qihoo360", "score": 0.9,
+            "evidence": ["so:libjiagu.so", "asset:libjiagu.so"],
+        }],
+        "vendor_candidates": [{"vendor": "360加固", "key": "qihoo360"}],
+        "dex_stub": False, "dex_classes": [4], "dex_status": "partial",
+    }
+    hyps = {h["kind"]: h for h in ps.collect_packer_hypotheses(sig)}
+    assert hyps["vendor"]["score"] > hyps["custom"]["score"]
+    decision = ps.decide_packer(sig)
+    assert decision["route"] == "vendor"
+    assert decision["name"] == "360加固"
+    assert any(h.get("family") == "jdog_native_dex_loader" for h in decision["hypotheses"])
+    assert ps.suggest_route(sig) == "vendor"
+    shell, nxt = ps._cli_conclusion(sig, "vendor")
+    assert shell == "360加固"
+    assert "厂商" in nxt
+
+
+def test_route_apkid_vendor_outranks_custom_family():
+    """APKiD 映射到 360 时同样压过 JDog family。"""
+    sig = {
+        "edition": None, "vmp": False, "dpt_shell": False,
+        "custom_family": "jdog_native_dex_loader",
+        "matched": [], "vendor_candidates": [],
+        "apkid_packers": ["360 Jiagu"],
+        "dex_stub": False, "dex_classes": [4], "dex_status": "partial",
+    }
+    assert ps.suggest_route(sig) == "vendor"
+
+
+def test_route_custom_family_beats_dpt_suspected():
+    """suspected dpt 仍不能抢走明确的 JDog，避免误套 dpt 流程。"""
+    sig = {
+        "edition": None, "vmp": False, "dpt_shell": True,
+        "dpt_type": "suspected", "custom_family": "jdog_native_dex_loader",
+        "matched": [], "dex_stub": True, "dex_classes": [1],
+    }
+    assert ps.suggest_route(sig) == "unknown"
+
+
+def test_route_confirmed_dpt_still_beats_custom_family():
+    """明确 dpt 类型仍走 dpt 专用路由。"""
+    sig = {
+        "edition": None, "vmp": False, "dpt_shell": True,
+        "dpt_type": "modified", "custom_family": "jdog_native_dex_loader",
+        "matched": [], "dex_stub": True, "dex_classes": [1],
+    }
+    assert ps.suggest_route(sig) == "dpt"
+
+
+def test_route_truncated_does_not_drop_confirmed_vendor():
+    """扫描截断是次级信号，不能覆盖已确认的厂商身份。"""
+    sig = {
+        "edition": None, "vmp": False, "dpt_shell": False,
+        "custom_family": None,
+        "matched": [{"vendor": "360加固", "key": "qihoo360"}],
+        "scan_stats": {"hidden_dex": {"truncated": True}},
+        "dex_stub": False, "dex_classes": [4], "dex_status": "ok",
+    }
+    assert ps.suggest_route(sig) == "vendor"
+
+
+def test_jdog_scores_above_dpt_suspected():
+    """JDog 0.65 > suspected dpt 0.45，所以不是靠 if 把 suspected 写在后面。"""
+    sig = {
+        "edition": None, "vmp": False, "dpt_shell": True,
+        "dpt_type": "suspected", "custom_family": "jdog_native_dex_loader",
+        "matched": [], "dex_stub": True, "dex_classes": [1],
+    }
+    hyps = {h["kind"]: h for h in ps.collect_packer_hypotheses(sig)}
+    assert hyps["custom"]["score"] > hyps["dpt"]["score"]
+    assert ps.decide_packer(sig)["route"] == "unknown"
 
 
 def test_route_vendor_when_matched():
@@ -703,3 +783,15 @@ def test_apkid_short_name_does_not_resolve(name):
 
 def test_apkid_multiple_packers_are_ambiguous():
     assert len(apkid.resolve_flows(["360", "tencent"])) == 2
+
+
+def test_apkid_canonical_key_qihoo360_resolves():
+    """packer_sigs 给出的 key=qihoo360 必须能映射到 360 插件。"""
+    assert apkid.resolve_flow(["qihoo360"]) == "unpacker/flow_360.py"
+
+
+def test_apkid_canonical_key_legu_and_yidun_resolve():
+    assert apkid.resolve_flow(["legu"]) == "unpacker/flow_legu.py"
+    assert apkid.resolve_flow(["yidun"]) == "unpacker/flow_netease.py"
+    assert apkid.IMPLEMENTED_FLOWS["unpacker/flow_legu.py"] == "legu"
+    assert apkid.IMPLEMENTED_FLOWS["unpacker/flow_netease.py"] == "yidun"

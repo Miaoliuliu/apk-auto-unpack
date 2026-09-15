@@ -1,6 +1,7 @@
 """产物目录命名：safe_product_stem / detect_folder_name / sanitize_filename 行为锁定。"""
 from __future__ import annotations
 
+from auto_unpack.flow.pipeline import _packer_confidence, _packer_name
 from auto_unpack.runtime.product import (
     detect_folder_name,
     safe_product_stem,
@@ -76,6 +77,33 @@ def test_folder_no_packer():
 
 def test_folder_vendor():
     assert detect_folder_name("360加固") == "360加固"
+
+
+def test_packer_name_vendor_outranks_custom_family():
+    """360 + JDog：归档目录跟分数更高的厂商身份走。"""
+    sig = {
+        "matched": [{
+            "vendor": "360加固", "key": "qihoo360", "score": 0.9,
+            "evidence": ["so:libjiagu.so", "asset:libjiagu.so"],
+        }],
+        "custom_family": "jdog_native_dex_loader",
+        "vmp": False, "dpt_shell": False,
+        "dex_stub": False, "dex_classes": [4],
+    }
+    name = _packer_name(sig)
+    assert name == "360加固"
+    assert detect_folder_name(name) == "360加固"
+    assert _packer_confidence(sig) == ("high", 0.9)
+
+
+def test_packer_name_custom_family_without_vendor():
+    sig = {
+        "matched": [], "custom_family": "jdog_native_dex_loader",
+        "vmp": False, "dpt_shell": False,
+        "dex_stub": False, "dex_classes": [2000],
+    }
+    assert _packer_name(sig) == "自研保护"
+    assert _packer_confidence(sig) == ("high", 0.65)
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Android APK 壳识别 + 脱壳 + 后端 URL 提取的自动化流水线。
 
-对输入 APK 做静态特征分析，识别加固壳（14 家厂商 + dpt-shell + 自研保护），无壳样本直接抽取后端 URL，dpt-shell 样本自动 frida 脱壳后抽取，其余转人工，最终产出分级 URL 清单。跑完自动卸载本次安装的 app、清理输入目录源文件。
+对输入 APK 做静态特征分析，识别加固壳（14 家厂商 + dpt-shell + 自研保护），无壳样本直接抽取后端 URL，dpt-shell、360、腾讯乐固、网易易盾自动动态脱壳后抽取，其余转人工，最终产出分级 URL 清单。跑完自动卸载本次安装的 app、清理输入目录源文件。
 
 ## 快速开始（一键启动）
 
@@ -10,14 +10,15 @@ Android APK 壳识别 + 脱壳 + 后端 URL 提取的自动化流水线。
 
 ```
 识别壳 → dpt-shell 自动脱壳 → 提取 URL
+       → 360 / 腾讯乐固 / 网易易盾 frida-dexdump -f -d 深度脱壳 → 提取 URL
        → 无壳直接提取 URL
-       → 厂商壳 / 自研保护 / VMP 转人工（不抽 URL）
+       → 其余厂商壳 / 自研保护 / 360付费版 / VMP 转人工（不抽 URL）
 ```
 
 前提：
 
-- 解释器用系统 Python 3.10：`C:/Program Files/Python310/python.exe`（唯一同时装了 frida + androguard 的环境）
-- 真机 USB 连着，frida-server 以 root 运行（dpt 脱壳需要）
+- 解释器用系统 Python 3.10：`C:/Program Files/Python310/python.exe`（唯一同时装了 frida + androguard + frida-dexdump 的环境）
+- 真机 USB 连着，frida-server 以 root 运行（dpt / 360 / 乐固 / 易盾脱壳需要）
 
 ## 安装
 
@@ -49,7 +50,7 @@ auto-unpack analyze <app.apk> --validate-http       # 可选 HTTP HEAD（默认�
 |---|---|---|
 | `device` | `null` | 空 = USB 第一台；多设备填 adb/frida 设备 ID |
 | `install` | `when_needed` | never / when_needed / always |
-| `sleep` | `20` | spawn 后最多等待秒数 |
+| `sleep` | `10` | spawn 后等待秒数（360 / 乐固 / 易盾：等主页面加载再 dump） |
 | `unpack` | `false` | 是否自动动态脱壳（dpt-shell） |
 | `uninstall` | `true` | 脱壳后卸载本次 adb install 装的 app（设备原有的不动） |
 | `timeout` | `300` | 有壳分析超时秒数 |

@@ -13,12 +13,13 @@
       1. method_code_stats()：统计「应有代码但 code_item 为空」的方法占比，用于脱壳产物校验。
       2. class_count()：根 dex 类数，用于判定根 classes.dex 是不是壳 stub。
 
-分流：
+分流（先给每条假设按证据打分，再选主壳，不用 if 顺序互斥）：
   无壳 → 直接提取 URL
-  dpt-shell（标准/魔改/内嵌ZIP/疑似，对外同一标签） → dpt 脱壳
-  常见厂商壳 → 该厂商脱壳插件
+  dpt-shell（标准/魔改/内嵌ZIP/疑似） → dpt 脱壳
+  确认的厂商身份文件 → 该厂商插件
   该厂商样本带 VMP → 标 VMP，转人工
-  自研保护（JDog / packhub / 根 dex stub / 根 dex 读不出） → 转人工分析（不提取 URL）
+  无更高分身份时的 JDog / packhub / 根 dex stub → 转人工
+  厂商与 JDog 同时存在时两边都保留，主壳取更高分那条
 
 用法:
     py -3.10 packer_sigs.py <app.apk> [--list]
@@ -799,72 +800,237 @@ def class_shortfall(dex_classes: list[int], size_mb: float) -> bool:
     return size_mb > 10 and 0 < total < PAYLOAD_CLASS_THRESHOLD
 
 
-def suggest_route(sig: dict) -> str:
-    """分流：manual / dpt / vendor / unknown / static。
+def _resolve_apkid_flows(names: list[str]) -> set[str]:
+    """APKiD / 静态 key → 已知脱壳流程集合。解析失败当没认出厂商。"""
+    if not names:
+        return set()
+    try:
+        from .apkid import resolve_flows
+        return {str(f) for f in resolve_flows(names) if f}
+    except Exception:
+        return set()
 
-    自研保护（route=unknown，转人工、不抽 URL）：
-      JDog / packhub / 根 dex stub / 根 dex 读不出
-    完整业务 dex（≥1000 类或 has_payload_dex）→ static
-    APKiD nested/protector、假 dex、畸形 Manifest 在可读 dex 上只进 evidence。
+
+# 证据强度（越高越像「主壳身份」）。数字含义：
+#   0.93  dpt 独有 native/特征文件（能从爱加密同名 so 里区分出来）
+#   0.90  厂商 so+assets 两路命中（PACKERS confirmed score）
+#   0.80  仅 APKiD 映射到已知流程，磁盘上还没有静态特征文件
+#   0.80  packhub 根类名（DexLoader），本身就是壳 stub 身份
+#   0.75  厂商单路命中
+#   0.65  JDog native loader：运行时附加载荷，解释不了「整包被哪家加固」
+#   0.45  dpt suspected，组合启发式
+# 选主壳用 max(score)；不同 route 同分才标 ambiguous。
+_DPT_EVIDENCE_SCORE = {
+    "standard": 0.93,
+    "modified": 0.93,
+    "appended": 0.93,
+    "suspected": 0.45,
+}
+_CUSTOM_FAMILY_SCORE = {
+    "jdog_native_dex_loader": 0.65,
+    "packhub_shell": 0.80,
+}
+_APKID_VENDOR_SCORE = 0.80
+_VENDOR_SCORE_DEFAULT = 0.75
+_COMMIT_SCORE = 0.45
+
+
+def collect_packer_hypotheses(sig: dict) -> list[dict]:
+    """把互不排斥的壳假设收集成带分数的列表，供 decide_packer 比较。"""
+    hyps: list[dict] = []
+    dpt_type = sig.get("dpt_type") if sig.get("dpt_shell") else None
+    if dpt_type in _DPT_EVIDENCE_SCORE:
+        hyps.append({
+            "kind": "dpt",
+            "route": "dpt",
+            "name": "dpt-shell",
+            "score": _DPT_EVIDENCE_SCORE[dpt_type],
+            "evidence": [f"dpt_type:{dpt_type}"],
+        })
+    for m in sig.get("matched") or []:
+        key = m.get("key")
+        try:
+            score = float(m.get("score") or _VENDOR_SCORE_DEFAULT)
+        except (TypeError, ValueError):
+            score = _VENDOR_SCORE_DEFAULT
+        hyps.append({
+            "kind": "vendor",
+            "route": "vendor",
+            "name": m.get("vendor") or key or "厂商壳",
+            "key": key,
+            "score": score,
+            "evidence": list(m.get("evidence") or []),
+        })
+    apkid_packers = [str(p) for p in (sig.get("apkid_packers") or []) if p]
+    apkid_flows = _resolve_apkid_flows(apkid_packers)
+    static_keys = [str(m.get("key")) for m in (sig.get("matched") or []) if m.get("key")]
+    static_flows = _resolve_apkid_flows(sorted(set(static_keys)))
+    if len(apkid_flows) == 1 and (not static_flows or static_flows == apkid_flows):
+        if not static_flows:
+            hyps.append({
+                "kind": "apkid_vendor",
+                "route": "vendor",
+                "name": apkid_packers[0],
+                "score": _APKID_VENDOR_SCORE,
+                "evidence": [f"apkid:{p}" for p in apkid_packers],
+            })
+    family = sig.get("custom_family")
+    if family:
+        hyps.append({
+            "kind": "custom",
+            "route": "unknown",
+            "name": "自研保护",
+            "family": family,
+            "score": _CUSTOM_FAMILY_SCORE.get(str(family), 0.60),
+            "evidence": [f"custom_family:{family}"],
+        })
+    return hyps
+
+
+def _vendor_identity_conflict(sig: dict, hyps: list[dict]) -> bool:
+    """两家确认厂商、或多家 APKiD 流程互相打架：无法用分数消解，只能 ambiguous。"""
+    keys = {h.get("key") for h in hyps if h.get("kind") == "vendor" and h.get("key")}
+    if len(keys) > 1:
+        return True
+    apkid_packers = [str(p) for p in (sig.get("apkid_packers") or []) if p]
+    if not apkid_packers:
+        return False
+    apkid_flows = _resolve_apkid_flows(apkid_packers)
+    if len(apkid_flows) > 1:
+        return True
+    static_flows = _resolve_apkid_flows(sorted(keys)) if keys else set()
+    return bool(static_flows and apkid_flows and static_flows != apkid_flows)
+
+
+def _select_primary(hyps: list[dict]) -> dict | str | None:
+    """按分数选主壳。不同 route 同分 → ambiguous；相同 route 取证据条数多的。"""
+    if not hyps:
+        return None
+    best = max(float(h["score"]) for h in hyps)
+    top = [h for h in hyps if abs(float(h["score"]) - best) < 1e-9]
+    if {h["route"] for h in top} != {top[0]["route"]}:
+        return "ambiguous"
+    top.sort(key=lambda h: len(h.get("evidence") or []), reverse=True)
+    return top[0]
+
+
+def _scan_truncated(sig: dict) -> bool:
+    scan_stats = sig.get("scan_stats") or {}
+    return any(isinstance(v, dict) and v.get("truncated") for v in scan_stats.values())
+
+
+def _unknown_decision(hyps: list[dict], *, score: float, reason: str) -> dict:
+    return {
+        "route": "unknown",
+        "name": "自研保护",
+        "score": score,
+        "reason": reason,
+        "winner": None,
+        "hypotheses": hyps,
+    }
+
+
+def decide_packer(sig: dict) -> dict:
+    """比较所有壳假设，返回主壳 route/name/score；落选假设留在 hypotheses 里。
+
+    付费版 / VMP 是处置策略（必须人工），不是和厂商身份比谁先写到。
+    其余假设全部打分后取最高分；JDog 不会因为排在前面就盖掉 360。
     """
+    hyps = collect_packer_hypotheses(sig)
     if sig.get("edition") == "paid" or any(
         m.get("edition") == "paid" for m in (sig.get("matched") or [])
     ):
-        return "manual"
+        vendors = "+".join(
+            (m.get("vendor") or m.get("key") or "?") for m in (sig.get("matched") or [])
+        )
+        return {
+            "route": "manual",
+            "name": vendors or "商业壳(付费/人工)",
+            "score": 1.0,
+            "reason": "paid_edition",
+            "winner": None,
+            "hypotheses": hyps,
+        }
     if sig.get("vmp"):
-        return "manual"
-    # 标准/魔改/内嵌 ZIP 是明确 dpt 证据，优先保留 dpt 专用路由。
-    # suspected 只代表组合启发式命中；若同时存在明确的 JDog native loader，
-    # 应优先按自研保护转人工，避免把自研 loader 误套 dpt 流程。
-    if sig.get("dpt_shell") and sig.get("dpt_type") in (
-        "standard", "modified", "appended",
-    ):
-        return "dpt"
-    if sig.get("custom_family"):
-        return "unknown"
+        vendors = "+".join(
+            (m.get("vendor") or m.get("key") or "?") for m in (sig.get("matched") or [])
+        )
+        return {
+            "route": "manual",
+            "name": f"{vendors}(VMP)" if vendors else "VMP/Dex2C",
+            "score": 0.96,
+            "reason": "vmp",
+            "winner": None,
+            "hypotheses": hyps,
+        }
+    if _vendor_identity_conflict(sig, hyps):
+        vendors = "+".join(
+            (m.get("vendor") or m.get("key") or "?") for m in (sig.get("matched") or [])
+        )
+        return {
+            "route": "ambiguous",
+            "name": vendors or "ambiguous",
+            "score": 0.7,
+            "reason": "vendor_identity_conflict",
+            "winner": None,
+            "hypotheses": hyps,
+        }
+
+    committed = [h for h in hyps if float(h["score"]) >= _COMMIT_SCORE]
+    primary = _select_primary(committed)
+    if primary == "ambiguous":
+        return {
+            "route": "ambiguous",
+            "name": "ambiguous",
+            "score": 0.7,
+            "reason": "tied_routes",
+            "winner": None,
+            "hypotheses": hyps,
+        }
+    if isinstance(primary, dict):
+        return {
+            "route": primary["route"],
+            "name": primary["name"],
+            "score": float(primary["score"]),
+            "reason": "highest_score",
+            "winner": primary,
+            "hypotheses": hyps,
+        }
+
     matched = sig.get("matched") or []
     if sig.get("vendor_candidates") and not matched:
-        return "unknown"
-    scan_stats = sig.get("scan_stats") or {}
-    if any(isinstance(v, dict) and v.get("truncated")
-           for v in scan_stats.values()):
-        return "unknown"
-    keys = {m.get("key") for m in matched if m.get("key")}
-    if len(keys) > 1:
-        return "ambiguous"
+        return _unknown_decision(hyps, score=0.35, reason="weak_vendor")
+    if _scan_truncated(sig):
+        return _unknown_decision(hyps, score=0.30, reason="scan_truncated")
     apkid_packers = [str(p) for p in (sig.get("apkid_packers") or []) if p]
-    if apkid_packers:
-        try:
-            from .apkid import resolve_flows
-            apkid_flows = set(resolve_flows(apkid_packers))
-        except Exception:
-            apkid_flows = set()
-        if len(apkid_flows) > 1:
-            return "ambiguous"
-        static_flows = set()
-        if keys:
-            try:
-                from .apkid import resolve_flows
-                static_flows = set(resolve_flows(sorted(keys)))
-            except Exception:
-                static_flows = set()
-        if static_flows and apkid_flows and static_flows != apkid_flows:
-            return "ambiguous"
-        if len(apkid_flows) == 1:
-            return "vendor"
-        if not matched:
-            return "unknown"
-    if matched:
-        return "vendor"
-    if sig.get("dpt_shell"):
-        return "dpt"
+    if apkid_packers and not matched:
+        return _unknown_decision(hyps, score=0.40, reason="unmapped_apkid")
     if sig.get("dex_status") in ("failed", "partial"):
-        return "unknown"
+        return _unknown_decision(hyps, score=0.50, reason="dex_status")
     if has_payload_dex(sig):
-        return "static"
+        return {
+            "route": "static",
+            "name": None,
+            "score": 0.2,
+            "reason": "payload_dex",
+            "winner": None,
+            "hypotheses": hyps,
+        }
     if dex_unreadable(sig) or sig.get("dex_stub"):
-        return "unknown"
-    return "static"
+        return _unknown_decision(hyps, score=0.55, reason="dex_stub")
+    return {
+        "route": "static",
+        "name": None,
+        "score": 0.2,
+        "reason": "no_packer_evidence",
+        "winner": None,
+        "hypotheses": hyps,
+    }
+
+
+def suggest_route(sig: dict) -> str:
+    """分流：manual / dpt / vendor / unknown / static。主壳由 decide_packer 按分数选出。"""
+    return decide_packer(sig)["route"]
 
 
 def _collect_file_names(files) -> tuple[set[str], set[str], set[str]]:
@@ -1615,7 +1781,22 @@ def _compose_result(
         "package_note": package_note,
     }
     result["dex_unreadable"] = dex_unreadable(result)
-    result["route"] = suggest_route(result)
+    decision = decide_packer(result)
+    result["route"] = decision["route"]
+    result["packer_decision"] = {
+        "primary": decision.get("name"),
+        "score": decision.get("score"),
+        "reason": decision.get("reason"),
+        "hypotheses": [
+            {
+                "kind": h.get("kind"),
+                "name": h.get("name"),
+                "route": h.get("route"),
+                "score": h.get("score"),
+            }
+            for h in (decision.get("hypotheses") or [])
+        ],
+    }
     return result
 
 
@@ -1736,11 +1917,11 @@ def _cli_conclusion(r: dict, route: str) -> tuple[str, str]:
             name = vendors or "商业壳(付费/人工)"
         return name, "需人工处理"
 
-    if route == "vendor" and r.get("matched"):
+    if route == "vendor":
         vendors = "+".join(
-            (m.get("vendor") or m.get("key") or "?") for m in r["matched"]
+            (m.get("vendor") or m.get("key") or "?") for m in (r.get("matched") or [])
         )
-        return vendors, "走对应厂商脱壳插件"
+        return vendors or "厂商壳", "走对应厂商脱壳插件"
 
     if route == "unknown":
         return "自研保护", "转人工分析"

@@ -5,14 +5,16 @@ probe / execute 对应方案书接口的最小实现。
 validate 在 validate.py，collect 由 pipeline + validate 完成。
 插件注册表（UNPACK_FLOWS / IMPLEMENTED_FLOWS）在 packer/apkid.py。
 
-已实现动态脱壳：仅 dpt-shell。厂商壳未实现插件时返回 unsupported（静态提取）。
+已实现动态脱壳：dpt-shell（自研 dump.js）、360 / 乐固 / 易盾
+（frida-dexdump -f -d）。其余厂商壳未实现插件时返回 unsupported。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-ADAPTERS = ("dpt-shell", "static", "unsupported", "manual", "skip")
+ADAPTERS = ("dpt-shell", "360", "legu", "yidun", "static", "unsupported", "manual", "skip")
+AUTOMATIC_ADAPTERS = ("dpt-shell", "dpt", "360", "legu", "yidun")
 
 
 def select_adapter(route: str, sig: dict, apkid_packers: list | None = None) -> str:
@@ -51,9 +53,10 @@ def execute(adapter: str, *, apk_path: str | None, package: str,
             deep: bool = False, timeout: int | None = None) -> list[Path]:
     """只 dump dex，返回路径列表。失败抛 RuntimeError。
 
-    deep / timeout 保留签名兼容；当前仅 dpt-shell 实现动态 dump。
+    360 / 乐固 / 易盾都走 frida-dexdump -f -d --sleep，忽略 deep。
     """
-    del deep, timeout, apk_path  # 未使用，保留调用方参数兼容
+    del deep, apk_path
+    wait = 10 if sleep is None else sleep
     if adapter == "unsupported":
         raise RuntimeError("unsupported_packer")
     if adapter == "manual":
@@ -62,9 +65,23 @@ def execute(adapter: str, *, apk_path: str | None, package: str,
         raise RuntimeError("unknown_packer")
     if adapter == "static":
         raise RuntimeError("static_no_dump")
+    if adapter in ("360", "qihoo360"):
+        from .flow_360 import dump as dump_360
+        return dump_360(
+            package, out_dir, device=device, sleep=wait, timeout=timeout,
+        )
+    if adapter in ("legu", "tencent"):
+        from .flow_legu import dump as dump_legu
+        return dump_legu(
+            package, out_dir, device=device, sleep=wait, timeout=timeout,
+        )
+    if adapter in ("yidun", "netease"):
+        from .flow_netease import dump as dump_yidun
+        return dump_yidun(
+            package, out_dir, device=device, sleep=wait, timeout=timeout,
+        )
     if adapter in ("dpt-shell", "dpt"):
         from .flow_dpt_shell import dump as dpt_dump
-        # sleep=0 是合法值（尽快收尾），不能用 or 判空——会把 0 吞成默认 20
-        return dpt_dump(package, out_dir, device=device,
-                        sleep=20 if sleep is None else sleep, kill=True)
+        # sleep=0 是合法值（尽快收尾），不能用 or 判空——会把 0 吞成默认 10
+        return dpt_dump(package, out_dir, device=device, sleep=wait, kill=True)
     raise RuntimeError(f"unsupported_adapter:{adapter}")

@@ -248,7 +248,7 @@ def test_execute_passes_sleep_zero(monkeypatch, tmp_path):
     assert captured["sleep"] == 0
 
 
-def test_execute_passes_sleep_none_defaults_20(monkeypatch, tmp_path):
+def test_execute_passes_sleep_none_defaults_10(monkeypatch, tmp_path):
     captured = {}
 
     def fake_dump(package, out_dir, device=None, sleep=None, kill=True):
@@ -258,7 +258,7 @@ def test_execute_passes_sleep_none_defaults_20(monkeypatch, tmp_path):
     monkeypatch.setattr(fd, "dump", fake_dump)
     adapters.execute("dpt-shell", apk_path=None, package="x",
                      out_dir=tmp_path, device=None, sleep=None)
-    assert captured["sleep"] == 20
+    assert captured["sleep"] == 10
 
 
 def test_execute_unknown_adapter_raises():
@@ -273,6 +273,26 @@ def test_select_adapter_route_map():
     assert adapters.select_adapter("manual", {}) == "manual"
     assert adapters.select_adapter("unknown", {}) == "skip"
     assert adapters.select_adapter("vendor", {"matched": []}) == "unsupported"
+
+
+def test_select_adapter_360_is_automatic():
+    sig = {"matched": [{"vendor": "360加固", "key": "qihoo360"}]}
+    assert adapters.select_adapter("vendor", sig) == "360"
+
+
+def test_select_adapter_legu_is_automatic():
+    sig = {"matched": [{"vendor": "腾讯乐固", "key": "legu"}]}
+    assert adapters.select_adapter("vendor", sig) == "legu"
+
+
+def test_select_adapter_yidun_is_automatic():
+    sig = {"matched": [{"vendor": "网易易盾", "key": "yidun"}]}
+    assert adapters.select_adapter("vendor", sig) == "yidun"
+
+
+def test_select_adapter_other_vendor_still_unsupported():
+    sig = {"matched": [{"vendor": "爱加密", "key": "ijiami"}]}
+    assert adapters.select_adapter("vendor", sig) == "unsupported"
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +353,164 @@ def test_summarize_completeness_no_payload():
     q = vd.summarize_completeness([{"name": "stub.dex", "payload": False}])
     assert q["complete"] is False
     assert q["skipped_stub_dex"] == ["stub.dex"]
+
+
+# ---------------------------------------------------------------------------
+# 360：frida-dexdump -d（深度搜索），不是 -p（attach-pid）
+# ---------------------------------------------------------------------------
+def test_build_dexdump_cmd_usb_deep_spawn(tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    cmd = f360.build_dexdump_cmd(
+        exe="frida-dexdump", package="com.foo", out_dir=tmp_path,
+        device=None, sleep=20,
+    )
+    assert cmd[:2] == ["frida-dexdump", "-U"]
+    assert "-f" in cmd and "com.foo" in cmd
+    assert "-d" in cmd
+    assert "-p" not in cmd
+    assert "--attach-pid" not in cmd
+    assert "-o" in cmd and str(tmp_path) in cmd
+    assert cmd[cmd.index("--sleep") + 1] == "20"
+
+
+def test_build_dexdump_cmd_device_id(tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    cmd = f360.build_dexdump_cmd(
+        exe="frida-dexdump", package="com.foo", out_dir=tmp_path,
+        device="ABCD1234", sleep=0,
+    )
+    assert "-U" not in cmd
+    assert cmd[cmd.index("-D") + 1] == "ABCD1234"
+    assert "-d" in cmd
+    assert cmd[cmd.index("--sleep") + 1] == "0"
+
+
+def test_find_frida_dexdump_env_override(monkeypatch, tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    fake = tmp_path / "frida-dexdump.exe"
+    fake.write_bytes(b"x")
+    monkeypatch.setenv("AUTO_UNPACK_FRIDA_DEXDUMP", str(fake))
+    monkeypatch.delenv("FRIDA_DEXDUMP", raising=False)
+    monkeypatch.setattr(f360.shutil, "which", lambda _: None)
+    assert f360.find_frida_dexdump() == str(fake)
+
+
+def test_find_frida_dexdump_missing(monkeypatch):
+    from auto_unpack.unpacker import flow_360 as f360
+    monkeypatch.delenv("AUTO_UNPACK_FRIDA_DEXDUMP", raising=False)
+    monkeypatch.delenv("FRIDA_DEXDUMP", raising=False)
+    monkeypatch.setattr(f360.shutil, "which", lambda _: None)
+    monkeypatch.setattr(f360.sys, "executable", str(Path("C:/missing/python.exe")))
+    with pytest.raises(RuntimeError, match="找不到 frida-dexdump"):
+        f360.find_frida_dexdump()
+
+
+def test_list_dumped_dex_classes_names(tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    raw = _mk_valid_dex()
+    (tmp_path / "classes.dex").write_bytes(raw)
+    (tmp_path / "classes02.dex").write_bytes(raw)
+    (tmp_path / "junk.txt").write_text("nope", encoding="utf-8")
+    names = [p.name for p in f360.list_dumped_dex(tmp_path)]
+    assert names == ["classes.dex", "classes02.dex"]
+
+
+def test_dump_360_invokes_dexdump(monkeypatch, tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    captured = {}
+    exe = tmp_path / "frida-dexdump.exe"
+    exe.write_bytes(b"x")
+    monkeypatch.setattr(f360, "find_frida_dexdump", lambda: str(exe))
+    monkeypatch.setattr(f360, "_force_stop", lambda *a, **k: None)
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["timeout"] = kw.get("timeout")
+        (tmp_path / "classes.dex").write_bytes(_mk_valid_dex())
+        class _R:
+            returncode = 0
+        return _R()
+
+    monkeypatch.setattr(f360, "proc_run", fake_run)
+    paths = f360.dump("com.foo", tmp_path, device=None, sleep=8, timeout=90)
+    assert [p.name for p in paths] == ["classes.dex"]
+    assert "-d" in captured["cmd"]
+    assert "-f" in captured["cmd"] and "com.foo" in captured["cmd"]
+    assert "-p" not in captured["cmd"]
+    assert captured["timeout"] == 90
+
+
+def test_dump_360_raises_when_no_dex(monkeypatch, tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    monkeypatch.setattr(f360, "find_frida_dexdump", lambda: "frida-dexdump")
+    monkeypatch.setattr(f360, "_force_stop", lambda *a, **k: None)
+
+    class _R:
+        returncode = 0
+
+    monkeypatch.setattr(f360, "proc_run", lambda *a, **k: _R())
+    with pytest.raises(RuntimeError, match="未产出有效 dex"):
+        f360.dump("com.foo", tmp_path, sleep=1, timeout=5)
+
+
+def test_execute_360_passes_sleep_zero(monkeypatch, tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    captured = {}
+
+    def fake_dump(package, out_dir, device=None, sleep=None, timeout=None):
+        captured["sleep"] = sleep
+        captured["timeout"] = timeout
+        return []
+
+    monkeypatch.setattr(f360, "dump", fake_dump)
+    adapters.execute(
+        "360", apk_path=None, package="x", out_dir=tmp_path,
+        device=None, sleep=0, timeout=12,
+    )
+    assert captured["sleep"] == 0
+    assert captured["timeout"] == 12
+
+
+# ---------------------------------------------------------------------------
+# 乐固 / 易盾：与 360 相同，frida-dexdump -f -d --sleep
+# ---------------------------------------------------------------------------
+def test_legu_and_yidun_dump_use_360_spawn(monkeypatch, tmp_path):
+    from auto_unpack.unpacker import flow_360 as f360
+    from auto_unpack.unpacker import flow_legu as fl
+    from auto_unpack.unpacker import flow_netease as fy
+    captured = []
+
+    def fake_dump(package, out_dir, device=None, sleep=10, timeout=None,
+                  vendor="360"):
+        captured.append((package, sleep, timeout, vendor))
+        return []
+
+    monkeypatch.setattr(f360, "dump", fake_dump)
+    fl.dump("com.legu", tmp_path, device=None, sleep=8, timeout=90)
+    fy.dump("com.yidun", tmp_path, device=None, sleep=3, timeout=12)
+    assert captured == [
+        ("com.legu", 8, 90, "腾讯乐固"),
+        ("com.yidun", 3, 12, "网易易盾"),
+    ]
+
+
+def test_execute_legu_and_yidun(monkeypatch, tmp_path):
+    from auto_unpack.unpacker import flow_legu as fl
+    from auto_unpack.unpacker import flow_netease as fy
+    captured = []
+
+    def fake_dump(package, out_dir, device=None, sleep=None, timeout=None):
+        captured.append((package, sleep, timeout))
+        return []
+
+    monkeypatch.setattr(fl, "dump", fake_dump)
+    monkeypatch.setattr(fy, "dump", fake_dump)
+    adapters.execute(
+        "legu", apk_path=None, package="a", out_dir=tmp_path,
+        device=None, sleep=0, timeout=11,
+    )
+    adapters.execute(
+        "yidun", apk_path=None, package="b", out_dir=tmp_path,
+        device=None, sleep=3, timeout=12,
+    )
+    assert captured == [("a", 0, 11), ("b", 3, 12)]

@@ -17,6 +17,7 @@ dependencies = [
 dump = [
     "frida>=16.0.0",
     "frida-tools",
+    "frida-dexdump",
 ]
 dev = [
     "androguard>=4.1.0",

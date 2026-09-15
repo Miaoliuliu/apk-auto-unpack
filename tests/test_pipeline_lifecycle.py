@@ -150,6 +150,41 @@ def test_uninstall_skips_when_not_installed(monkeypatch):
     assert calls == []
 
 
+def test_confirmed_vendor_not_unknown_when_dpt_suspected():
+    """绘本：360 确认 + dpt suspected + JDog。主壳是 360，应允许动态脱壳。"""
+    from auto_unpack.extraction.report import packed_flag
+    from auto_unpack.flow.pipeline import _packer_status
+
+    sig = {
+        "vmp": False,
+        "dpt_shell": True,
+        "dpt_type": "suspected",
+        "custom_family": "jdog_native_dex_loader",
+        "matched": [{
+            "vendor": "360加固", "key": "qihoo360", "score": 0.9,
+        }],
+    }
+    st = _packer_status("vendor", sig)
+    assert st == "PACKER_IDENTIFIED"
+    assert packed_flag("vendor", st) is True
+
+
+def test_dpt_suspected_alone_still_unknown():
+    """没有厂商身份、主壳只是 suspected dpt 时，仍禁止强行脱壳。"""
+    from auto_unpack.extraction.report import packed_flag
+    from auto_unpack.flow.pipeline import _packer_status
+
+    sig = {
+        "vmp": False,
+        "dpt_shell": True,
+        "dpt_type": "suspected",
+        "matched": [],
+    }
+    st = _packer_status("dpt", sig)
+    assert st == "PACKER_SUSPECTED"
+    assert packed_flag("dpt", st) == "unknown"
+
+
 def test_uninstall_swallows_error(monkeypatch):
     """uninstall 抛异常不中断流程，记 warning。"""
 
