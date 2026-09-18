@@ -30,7 +30,12 @@ APK/
 # IDE / editor
 .idea/
 .vscode/
+.cursor/
 *.iml
+
+# Local-only workflow (kept on disk, not published)
+tests/
+交接文档.md
 
 # Agent / session notes
 .workbuddy/
