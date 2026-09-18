@@ -38,6 +38,7 @@ tests/
 .github/
 项目文档/
 交接文档.md
+src/auto_unpack/extraction/net_hook.js
 
 # Agent / session notes
 .workbuddy/
