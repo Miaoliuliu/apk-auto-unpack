@@ -35,6 +35,8 @@ APK/
 
 # Local-only workflow (kept on disk, not published)
 tests/
+.github/
+项目文档/
 交接文档.md
 
 # Agent / session notes

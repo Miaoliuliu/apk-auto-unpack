@@ -68,12 +68,12 @@ auto-unpack analyze <app.apk> --validate-http       # 可选 HTTP HEAD（默认�
 │   ├── constants.py    跨层契约（状态、错误码）
 │   └── dex_utils.py    DEX 基础设施（头校验、校验和修复）
 ├── tests/              行为锁定测试（本地，不入库）
+├── 项目文档/           PRD / 周报 / 总览（本地，不入库）
 ├── outputs/            产物目录（运行时生成，不入库）
 │   ├── packer_detection/  按壳名归档
 │   ├── unpacked_dex/      动态脱壳 dex
 │   └── extracted_urls/    urls_by_rank.txt + urls.txt + indicators.jsonl + meta.json
 ├── APK/                待分析 APK 入口（运行时，不入库）
-├── 项目文档/           PRD、项目总览等长期文档
 └── pyproject.toml
 ```
 
