@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import struct
 import sys
 import zipfile
@@ -63,14 +64,23 @@ def fix_dex_header(data: bytes) -> bytes:
     return bytes(b)
 
 
-def repair_dumped_dexes(out_dir: Path | str, keep_original: bool = True) -> int:
+def purge_dump_sidecars(out_dir: Path | str) -> None:
+    """删掉样本目录里的 raw/、_invalid_dex/，只留顶层修好的 dex。"""
+    d = Path(out_dir)
+    for name in ("raw", "_invalid_dex"):
+        p = d / name
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def repair_dumped_dexes(out_dir: Path | str, keep_original: bool = False) -> int:
     """修复脱壳目录里损坏的 dex 头，返回写回了几个文件。
 
-    写回前把原始字节拷到 <dir>/raw/，满足「结构修复时保留原始导出」。
+    直接覆盖写回；不保留原文件。keep_original 已废弃（忽略）。
     """
+    del keep_original
     n = 0
     d = Path(out_dir)
-    raw_dir = d / "raw"
     for p in sorted(d.glob("*.dex")):
         if not p.is_file():
             continue
@@ -86,13 +96,9 @@ def repair_dumped_dexes(out_dir: Path | str, keep_original: bool = True) -> int:
         fixed = fix_dex_header(data)
         if fixed == data:
             continue
-        if keep_original:
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            dest = raw_dir / p.name
-            if not dest.exists():
-                dest.write_bytes(data)
         p.write_bytes(fixed)
         n += 1
+    purge_dump_sidecars(d)
     return n
 
 

@@ -19,7 +19,12 @@ import sys
 from pathlib import Path
 
 from ..runtime.proc import run as proc_run
-from .flow_dpt_shell import is_valid_dumped_dex
+from .flow_dpt_shell import (
+    dedupe_dumped_dex,
+    is_valid_dumped_dex,
+    purge_truncated_dex,
+    warn_suspect_dumped_dex,
+)
 
 ADAPTER = "360"
 _DEFAULT_SLEEP = 10
@@ -74,9 +79,13 @@ def list_dumped_dex(out_dir: Path) -> list[Path]:
 
 
 def quarantine_invalid_dex(out_dir: Path) -> list[Path]:
-    """把顶层无效 *.dex 挪到 _invalid_dex/。"""
-    junk_dir = Path(out_dir) / "_invalid_dex"
-    moved: list[Path] = []
+    """删除顶层无效 *.dex。
+
+    只按 is_valid_dumped_dex 的硬校验（magic / header_size / file_size）判定，
+    不做启发式剔除 —— 实测「冗余量」「含内嵌 dex 标记」等判据会把正常产物
+    误判为垃圾（全样本 767 个里误伤 126 个），故降级为告警（见 warn_suspect_*）。
+    """
+    discarded: list[Path] = []
     for p in sorted(Path(out_dir).glob("*.dex")):
         try:
             data = p.read_bytes()
@@ -84,13 +93,9 @@ def quarantine_invalid_dex(out_dir: Path) -> list[Path]:
             continue
         if is_valid_dumped_dex(data):
             continue
-        junk_dir.mkdir(parents=True, exist_ok=True)
-        dest = junk_dir / p.name
-        if dest.exists():
-            dest = junk_dir / (p.stem + "_" + str(p.stat().st_size) + p.suffix)
-        p.replace(dest)
-        moved.append(dest)
-    return moved
+        p.unlink(missing_ok=True)
+        discarded.append(p)
+    return discarded
 
 
 def _force_stop(package: str, device: str | None) -> None:
@@ -139,11 +144,21 @@ def dump(
 
     moved = quarantine_invalid_dex(out_dir)
     if moved:
-        print(f"[*] 隔离无效 dump {len(moved)} 个 -> {out_dir / '_invalid_dex'}")
-    from ..dex_utils import repair_dumped_dexes
+        print(f"[*] 删除无效 dump {len(moved)} 个")
+    trunc = purge_truncated_dex(out_dir, pattern="classes*.dex")
+    if trunc:
+        print(f"[*] 删除截断 dump {len(trunc)} 个（class_data 越界）")
+    # frida-dexdump 产出 classes.dex / classes02.dex；深度搜索在内存页边界多读
+    # 一段会造成大小成对，此处按头部元组去重（相对判定，实测 ADIA 25/25 精确命中）。
+    dup = dedupe_dumped_dex(out_dir, pattern="classes*.dex")
+    if dup:
+        print(f"[*] 删除同源边界副本 {len(dup)} 个")
+    warn_suspect_dumped_dex(out_dir, pattern="classes*.dex")
+    from ..dex_utils import purge_dump_sidecars, repair_dumped_dexes
     fixed = repair_dumped_dexes(out_dir)
     if fixed:
         print(f"[*] 已重算 {fixed} 个 dex 的 checksum/SHA-1")
+    purge_dump_sidecars(out_dir)
     dexes = list_dumped_dex(out_dir)
     print(f"\n[*] {vendor} dump 结束: {len(dexes)} 个有效 dex -> {out_dir}")
     if not dexes:

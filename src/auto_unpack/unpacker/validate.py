@@ -44,8 +44,17 @@ def is_payload_dex(path: Path, stats: dict | None = None) -> bool:
     fw = float(stats.get("framework_ratio") or 0.0)
     if fw >= 0.85:
         return False
+    # 体积达标即视为业务 dex。
+    #
+    # 曾改为「条目数与体积相称」（entries/size 密度）以拦下 ADIA/classes08.dex
+    # （17.9MB / 4 个类）这类体积伪装，实测**严重误伤**：绘本 252 个 dex 中
+    # 体积最大的那些（25MB / classes 192~251 / 方法 1000+）密度仅 0.05~0.07
+    # 每 KB，全被判为非业务 dex。原因是这批 dump 产物的 file_size 天然包含
+    # 内存邻近区块，体积/内容比本就偏低，密度不是可靠判据。
+    # 结论：只保留 `entries > 0` 这一极保守保护（挡纯填充），体积伪装交给
+    # dedupe_dumped_dex（同源去重）与告警（warn_suspect_dumped_dex）处理。
     if size >= PAYLOAD_ALWAYS_BYTES:
-        return True
+        return (classes + concrete) > 0
     if classes >= PAYLOAD_MIN_CLASSES and concrete >= PAYLOAD_MIN_CONCRETE:
         return True
     if size >= PAYLOAD_MIN_BYTES and classes >= 10:

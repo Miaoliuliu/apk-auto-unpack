@@ -87,7 +87,7 @@ pytest
 
 ## 产物路径约定
 
-产物统一落在 `outputs/` 下。测试可设环境变量隔离：
+产物统一落在 `outputs/` 下。`unpacked_dex/<样本>/` 只留修复后的 `*.dex`（`raw/`、`_invalid_dex/` 会删掉）。测试可设环境变量隔离：
 
 - `AUTO_UNPACK_PRODUCT_ROOT=<临时目录>` — 产物根目录
 - `AUTO_UNPACK_DISABLE_ARCHIVE=1` — 禁止壳识别归档
